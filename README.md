@@ -54,3 +54,8 @@ npm test
 ## 📄 License
 
 MIT © Contributors
+
+### anomalyDetector
+## Time-Series Anomaly Detection
+
+The `AnomalyDetector` module implements robust time-series anomaly detection using moving average trend removal and Z-score thresholding. It is useful for monitoring production metrics, identifying sensor spikes, or flagging unusual transactions. The class accepts a raw array of numbers and configuration options for window size and sensitivity, then returns a detailed report including indices and Z-scores for identified anomalies.
