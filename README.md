@@ -17,5 +17,5 @@ Every day the bot:
 
 ---
 <!-- bot-update -->
-## Quality Assurance
-Recent updates include the implementation of a pre-commit validation layer. All AI-generated content, particularly JSON structures, is now validated for syntactic correctness and size constraints before being appended to the repository. This ensures that the `CHANGELOG.md` and `README.md` remain parseable and that the automation pipeline fails gracefully rather than introducing broken artifacts. Developers monitoring the bot can expect that any failed validation events will be logged in the run history with specific error details, aiding in rapid troubleshooting of model output anomalies.
+## Documentation Consistency
+Added automated Markdown linting to the daily pipeline. This ensures that all generated changelog and README updates maintain strict formatting standards, including proper heading hierarchy and link integrity. The bot now performs a self-check on document structure before committing, reducing the likelihood of rendering artifacts in GitHub's UI.
