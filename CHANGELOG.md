@@ -1,4 +1,5 @@
-# Changelog
+## [2026-08-30]
+- **feat(data-science)**: add time-series anomaly detector with moving average decomposition and z-score thresholding
 
 All notable changes to this project will be documented in this file.
 
