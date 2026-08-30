@@ -1,5 +1,16 @@
 [
   {
+    "id": 1788105442599,
+    "timestamp": "2026-08-30T15:57:22.599Z",
+    "status": "error",
+    "summary": "Bot run failed",
+    "commitSha": null,
+    "commitUrl": null,
+    "filesChanged": [],
+    "durationMs": 0,
+    "error": "Groq API error 400 (model: gemma2-9b-it): The model `gemma2-9b-it` has been decommissioned and is no longer supported. Please refer to https://console.groq.com/docs/deprecations for a recommendation on which model to use instead."
+  },
+  {
     "id": 1788105299777,
     "timestamp": "2026-08-30T15:54:59.777Z",
     "status": "error",
