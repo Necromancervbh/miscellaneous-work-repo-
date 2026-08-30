@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**STL Anomaly Detection Service API**](./projects/stl-anomaly-detection-service/) | `Full-Stack` | Node.js / Express / TypeScript | REST API that runs STL‑based time‑series anomaly detection and returns timestamps of outliers. |
 | [**01. Time-Series Anomaly Detection**](./projects/01-time-series-anomaly-detection/) | `Data Science` | JavaScript / Stats | Moving-window STL trend decomposition with Z-score outlier detection for streaming metrics. |
 | [**02. Async Functional Toolkit**](./projects/02-async-functional-toolkit/) | `Full-Stack / Utils` | JavaScript / Async | Resilient exponential retry backoff, debounce, throttle, and functional pipeline combinators. |
 
