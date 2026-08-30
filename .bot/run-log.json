@@ -1,5 +1,16 @@
 [
   {
+    "id": 1788105299777,
+    "timestamp": "2026-08-30T15:54:59.777Z",
+    "status": "error",
+    "summary": "Bot run failed",
+    "commitSha": null,
+    "commitUrl": null,
+    "filesChanged": [],
+    "durationMs": 0,
+    "error": "Groq API error 404: The model `llama-3.3-70b-versatile` does not exist or you do not have access to it."
+  },
+  {
     "id": 1788104578231,
     "timestamp": "2026-08-30T15:42:58.231Z",
     "status": "error",
