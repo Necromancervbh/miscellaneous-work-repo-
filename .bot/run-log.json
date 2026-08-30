@@ -1,0 +1,13 @@
+[
+  {
+    "id": 1788104071451,
+    "timestamp": "2026-08-30T15:34:31.451Z",
+    "status": "error",
+    "summary": "Bot run failed",
+    "commitSha": null,
+    "commitUrl": null,
+    "filesChanged": [],
+    "durationMs": 0,
+    "error": "Grok API error 400: Bad Request"
+  }
+]
