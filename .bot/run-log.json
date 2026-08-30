@@ -1,5 +1,16 @@
 [
   {
+    "id": 1788104275650,
+    "timestamp": "2026-08-30T15:37:55.650Z",
+    "status": "error",
+    "summary": "Bot run failed",
+    "commitSha": null,
+    "commitUrl": null,
+    "filesChanged": [],
+    "durationMs": 0,
+    "error": "Grok API error 400: {\"code\":\"invalid-argument\",\"error\":\"Model not found: grok-beta\"}"
+  },
+  {
     "id": 1788104071451,
     "timestamp": "2026-08-30T15:34:31.451Z",
     "status": "error",
