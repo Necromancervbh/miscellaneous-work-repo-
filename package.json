@@ -1,0 +1,15 @@
+{
+  "name": "nexus-core",
+  "version": "0.1.0",
+  "description": "High-performance modular developer utilities and data structures for JS/TS",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "types": "types/index.d.ts",
+  "scripts": {
+    "test": "vitest run",
+    "lint": "eslint src/",
+    "build": "tsc"
+  },
+  "keywords": ["utilities", "algorithms", "data-structures", "async", "typescript"],
+  "license": "MIT"
+}
