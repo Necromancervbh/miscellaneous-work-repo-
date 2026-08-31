@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Detection Aggregator**](./projects/anomaly-detection-aggregator/) | `Data Science` | TypeScript / Node.js | Aggregates multi‑model anomalies via WebSocket, exposes unified API. |
 | [**Anomaly Detection Orchestrator**](./projects/anomaly-detection-orchestrator/) | `Full-Stack` | Node.js / TypeScript / WebSocket | Unified API merging STL and Kalman filters with real‑time streaming. |
 | [**STL Anomaly Detection Client SDK**](./projects/stl-anomaly-detection-client/) | `Backend Tools` | TypeScript / Node.js / Axios | A lightweight TypeScript client library to consume the STL Anomaly Detection Service API with validation, retry, and batch processing support. |
 | [**STL Anomaly Detection Service API**](./projects/stl-anomaly-detection-service/) | `Full-Stack` | Node.js / Express / TypeScript | REST API that runs STL‑based time‑series anomaly detection and returns timestamps of outliers. |
