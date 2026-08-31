@@ -1,0 +1,8 @@
+{
+  "projectName": "STL Anomaly Detection Client SDK",
+  "version": "1.0.0",
+  "sampleRecords": [
+    { "id": 1, "value": 42.5, "status": "active" },
+    { "id": 2, "value": 18.2, "status": "verified" }
+  ]
+}
