@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Real‑Time Anomaly Alerting Service**](./projects/anomaly-detection-alerting/) | `Data Science` | Node.js / TypeScript / Python | Detects anomalies and sends alerts via API and WebSocket. |
 | [**Real‑Time Anomaly Detection Pipeline**](./projects/anomaly-detection-pipeline/) | `Data Science` | TypeScript / Node.js | Streaming ETL that aggregates, filters, and visualizes anomalies in real time. |
 | [**Real‑Time Anomaly Detection Dashboard**](./projects/anomaly-detection-dashboard/) | `Data Science` | TypeScript / Node.js / React | Unified UI for streaming anomaly detection and analytics. |
 | [**Anomaly Detection Aggregator**](./projects/anomaly-detection-aggregator/) | `Data Science` | TypeScript / Node.js | Aggregates multi‑model anomalies via WebSocket, exposes unified API. |
