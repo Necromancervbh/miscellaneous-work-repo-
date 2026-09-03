@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Explainability API**](./projects/anomaly-explainability-api/) | `Data Science` | Node.js / TypeScript | API delivering Bayesian explanation scores for detected anomalies. |
 | [**Anomaly Explanation Service**](./projects/anomaly-explanation-service/) | `Data Science` | TypeScript / Node.js / ML | Generates root‑cause insights for detected anomalies. |
 | [**Real‑Time Anomaly Alerting Service**](./projects/anomaly-detection-alerting/) | `Data Science` | Node.js / TypeScript / Python | Detects anomalies and sends alerts via API and WebSocket. |
 | [**Real‑Time Anomaly Detection Pipeline**](./projects/anomaly-detection-pipeline/) | `Data Science` | TypeScript / Node.js | Streaming ETL that aggregates, filters, and visualizes anomalies in real time. |
