@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Real-Time Anomaly Dashboard**](./projects/anomaly-dashboard-realtime/) | `Full-Stack` | Node.js, TypeScript, WebSocket, Redis | Live UI streams anomaly scores with explainability. |
 | [**Anomaly Explainability Orchestrator**](./projects/anomaly-explainability-orchestrator/) | `Data Science` | Node.js / TypeScript | Unified API merging detection, clustering, and Bayesian scoring. |
 | [**Anomaly Explainability API**](./projects/anomaly-explainability-api/) | `Data Science` | Node.js / TypeScript | API delivering Bayesian explanation scores for detected anomalies. |
 | [**Anomaly Explanation Service**](./projects/anomaly-explanation-service/) | `Data Science` | TypeScript / Node.js / ML | Generates root‑cause insights for detected anomalies. |
