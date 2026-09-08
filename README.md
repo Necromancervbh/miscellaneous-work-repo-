@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Insights Aggregator**](./projects/anomaly-insights-aggregator/) | `Data Science` | TypeScript / Node.js | Aggregates multi-source anomaly data, applies PCA, clustering, and Bayesian scoring for unified insights. |
 | [**Anomaly Incident Response Orchestrator**](./projects/anomaly-incident-response/) | `Data Science` | Node.js / TypeScript | Automates ranking, enrichment, and notification of anomalies across services. |
 | [**Anomaly Management Platform**](./projects/anomaly-management-platform/) | `Data Science` | Node.js / TypeScript | Unified API orchestrating detection, explainability, and real‑time alerts. |
 | [**Real-Time Anomaly Dashboard**](./projects/anomaly-dashboard-realtime/) | `Full-Stack` | Node.js, TypeScript, WebSocket, Redis | Live UI streams anomaly scores with explainability. |
