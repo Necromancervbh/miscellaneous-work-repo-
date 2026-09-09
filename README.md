@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Visualizer**](./projects/anomaly-correlation-visualizer/) | `Data Science` | Node.js / TypeScript / D3 | Interactive UI to explore multi‑sensor anomaly correlations. |
 | [**Anomaly Correlation Engine**](./projects/anomaly-correlation-engine/) | `Data Science` | TypeScript / Node.js / PostgreSQL | Detects correlated anomalies across multiple streams in real time. |
 | [**Anomaly Insights Aggregator**](./projects/anomaly-insights-aggregator/) | `Data Science` | TypeScript / Node.js | Aggregates multi-source anomaly data, applies PCA, clustering, and Bayesian scoring for unified insights. |
 | [**Anomaly Incident Response Orchestrator**](./projects/anomaly-incident-response/) | `Data Science` | Node.js / TypeScript | Automates ranking, enrichment, and notification of anomalies across services. |
