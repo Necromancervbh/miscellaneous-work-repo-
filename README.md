@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Forecast Scheduler**](./projects/anomaly-correlation-scheduler/) | `Data Science` | TypeScript / Node.js | Orchestrates timed forecasts with rate limits and auth. |
 | [**Anomaly Correlation Forecast Service**](./projects/anomaly-correlation-forecast/) | `Data Science` | Node.js / TypeScript / Python | Generates forecasts and confidence intervals for anomaly scores. |
 | [**Anomaly Correlation API**](./projects/anomaly-correlation-api/) | `Data Science` | TypeScript / Node.js | REST API unifying dashboard, notifier, and analytics. |
 | [**Anomaly Correlation Dashboard**](./projects/anomaly-correlation-dashboard/) | `Full-Stack` | Node.js/React/TS | Web UI aggregating anomaly streams with live alerts. |
