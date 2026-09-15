@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Aggregator**](./projects/anomaly-correlation-aggregator/) | `Data Science` | Node.js, TypeScript, TensorFlow.js | Aggregates multi‑sensor anomalies using Kalman filter and DBSCAN. |
 | [**Anomaly Correlation Evaluation Service**](./projects/anomaly-correlation-evaluator/) | `Data Science` | TypeScript / Node.js | Computes cross‑validated metrics and visual reports for anomaly detection pipelines. |
 | [**Anomaly Correlation Forecast Scheduler**](./projects/anomaly-correlation-scheduler/) | `Data Science` | TypeScript / Node.js | Orchestrates timed forecasts with rate limits and auth. |
 | [**Anomaly Correlation Forecast Service**](./projects/anomaly-correlation-forecast/) | `Data Science` | Node.js / TypeScript / Python | Generates forecasts and confidence intervals for anomaly scores. |
