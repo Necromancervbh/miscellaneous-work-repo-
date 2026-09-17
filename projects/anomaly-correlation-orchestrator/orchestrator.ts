@@ -1,180 +1,193 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { json } from 'body-parser';
+import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
 import { Queue, Worker, QueueScheduler, Job } from 'bullmq';
 import IORedis from 'ioredis';
-import { RateLimiterRedis } from 'rate-limiter-flexible';
-import LRUCache from 'lru-cache';
-import http from 'http';
 import { Server as WebSocketServer, WebSocket } from 'ws';
-import { AddressInfo } from 'net';
-import { randomUUID } from 'crypto';
+import http from 'http';
+import bodyParser from 'body-parser';
+import { schedule as scheduleTask } from './scheduler';
+import { aggregate as aggregateResults } from './aggregator';
+import { explain as explainResults } from './explainability';
+import { evaluate as evaluateResults } from './evaluator';
+import dotenv from 'dotenv';
 
-// Types
-interface CorrelationMatrixPayload {
-  clientId: string;
-  timestamp: string; // ISO string
-  matrix: number[][]; // square matrix
+dotenv.config();
+
+const JWT_SECRET = process.env.JWT_SECRET || 'default_secret';
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
+/**
+ * Interface extending Express Request to include authenticated user payload.
+ */
+interface AuthenticatedRequest extends Request {
+  user?: { id: string; [key: string]: any };
 }
 
-// Configuration defaults
-const DEFAULT_HTTP_PORT = 3000;
-const DEFAULT_WS_PORT = 3001;
-const DEFAULT_REDIS_URL = 'redis://127.0.0.1:6379';
-const RATE_LIMIT_POINTS = 10; // requests
-const RATE_LIMIT_DURATION = 60; // per seconds
-const LRU_MAX_ITEMS = 200;
-const LRU_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
-
-export class OrchestratorService {
-  private readonly app = express();
-  private readonly httpServer: http.Server;
-  private readonly wsServer: WebSocketServer;
-  private readonly redis: IORedis.Redis;
-  private readonly queue: Queue;
-  private readonly worker: Worker;
-  private readonly queueScheduler: QueueScheduler;
-  private readonly rateLimiter: RateLimiterRedis;
-  private readonly cache: LRUCache<string, number[][]>;
-  private readonly wsClients = new Set<WebSocket>();
-
-  constructor(
-    private readonly httpPort: number = DEFAULT_HTTP_PORT,
-    private readonly wsPort: number = DEFAULT_WS_PORT,
-    private readonly redisUrl: string = DEFAULT_REDIS_URL
-  ) {
-    // Initialize Redis connection
-    this.redis = new IORedis(this.redisUrl);
-
-    // Initialize BullMQ components
-    this.queue = new Queue('correlation-jobs', { connection: this.redis });
-    this.queueScheduler = new QueueScheduler('correlation-jobs', { connection: this.redis });
-    this.worker = new Worker(
-      'correlation-jobs',
-      async (job: Job) => this.processJob(job),
-      { connection: this.redis }
-    );
-
-    // Initialize rate limiter per client IP
-    this.rateLimiter = new RateLimiterRedis({
-      storeClient: this.redis,
-      points: RATE_LIMIT_POINTS,
-      duration: RATE_LIMIT_DURATION,
-      keyPrefix: 'rlflx',
-    });
-
-    // Initialize LRU cache for recent matrices
-    this.cache = new LRUCache<string, number[][]>({
-      max: LRU_MAX_ITEMS,
-      ttl: LRU_MAX_AGE_MS,
-    });
-
-    // Express middlewares
-    this.app.use(json());
-    this.app.use(this.rateLimitMiddleware.bind(this));
-    this.app.use(this.errorHandler.bind(this));
-
-    // Routes
-    this.app.post('/correlation', this.handleCorrelation.bind(this));
-
-    // HTTP server
-    this.httpServer = http.createServer(this.app);
-
-    // WebSocket server
-    this.wsServer = new WebSocketServer({ noServer: true });
-    this.wsServer.on('connection', this.handleWsConnection.bind(this));
-    this.httpServer.on('upgrade', (request, socket, head) => {
-      if (request.url === '/ws') {
-        this.wsServer.handleUpgrade(request, socket, head, (ws) => {
-          this.wsServer.emit('connection', ws, request);
-        });
-      } else {
-        socket.destroy();
-      }
-    });
-
-    // Worker event handling
-    this.worker.on('completed', (job) => this.emitWsEvent('correlationCompleted', job.returnvalue));
-    this.worker.on('failed', (job, err) => this.emitWsEvent('correlationFailed', { jobId: job?.id, error: err?.message }));
+/**
+ * JWT authentication middleware.
+ * Verifies token and attaches payload to request object.
+ */
+function authenticateJWT(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Authorization header missing' });
   }
 
-  // Rate limiting middleware
-  private async rateLimitMiddleware(req: Request, res: Response, next: NextFunction) {
-    const ip = req.ip;
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Bearer token missing' });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { id: string };
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+/**
+ * Rate limiter: max 60 requests per minute per IP.
+ */
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+/**
+ * Redis connection for BullMQ.
+ */
+const redisConnection = new IORedis(REDIS_URL);
+
+/**
+ * BullMQ queue and scheduler for task processing.
+ */
+const taskQueue = new Queue('tasks', { connection: redisConnection });
+const taskQueueScheduler = new QueueScheduler('tasks', {
+  connection: redisConnection,
+});
+
+/**
+ * In‑memory map of userId => WebSocket connection.
+ * Used to push results back to the originating client.
+ */
+const wsClients = new Map<string, WebSocket>();
+
+/**
+ * Helper to validate incoming task payload.
+ */
+function validateTaskPayload(payload: any): { valid: boolean; error?: string } {
+  if (typeof payload !== 'object' || payload === null) {
+    return { valid: false, error: 'Payload must be a JSON object' };
+  }
+  if (!payload.type || typeof payload.type !== 'string') {
+    return { valid: false, error: 'Missing or invalid "type" field' };
+  }
+  // Additional domain‑specific validation can be added here.
+  return { valid: true };
+}
+
+/**
+ * Core processing pipeline.
+ * Executes scheduler, aggregator, explainability, and evaluator sequentially.
+ * Returns a combined result object.
+ */
+async function processTask(task: any, userId: string, jobId: string) {
+  // Scheduler may produce a schedule object.
+  const scheduleResult = await scheduleTask(task);
+  // Aggregator consumes schedule result.
+  const aggregationResult = await aggregateResults(scheduleResult);
+  // Explainability consumes aggregation result.
+  const explanationResult = await explainResults(aggregationResult);
+  // Evaluator consumes explanation result.
+  const evaluationResult = await evaluateResults(explanationResult);
+
+  return {
+    schedule: scheduleResult,
+    aggregation: aggregationResult,
+    explanation: explanationResult,
+    evaluation: evaluationResult,
+    meta: { userId, jobId },
+  };
+}
+
+/**
+ * BullMQ worker that processes queued tasks.
+ * After processing, pushes result to the user's WebSocket if connected.
+ */
+const taskWorker = new Worker(
+  'tasks',
+  async (job: Job) => {
+    const { task, userId, jobId } = job.data;
     try {
-      await this.rateLimiter.consume(ip);
-      next();
-    } catch (rlRejected) {
-      res.status(429).json({ error: 'Too Many Requests' });
-    }
-  }
-
-  // Input validation helper
-  private validatePayload(payload: any): payload is CorrelationMatrixPayload {
-    if (typeof payload !== 'object' || payload === null) return false;
-    if (typeof payload.clientId !== 'string' || payload.clientId.trim() === '') return false;
-    if (typeof payload.timestamp !== 'string' || isNaN(Date.parse(payload.timestamp))) return false;
-    if (!Array.isArray(payload.matrix) || payload.matrix.length === 0) return false;
-    const size = payload.matrix.length;
-    for (const row of payload.matrix) {
-      if (!Array.isArray(row) || row.length !== size) return false;
-      for (const val of row) {
-        if (typeof val !== 'number' || !isFinite(val)) return false;
+      const result = await processTask(task, userId, jobId);
+      const ws = wsClients.get(userId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ jobId, status: 'completed', result }));
       }
-    }
-    return true;
-  }
-
-  // POST /correlation handler
-  private async handleCorrelation(req: Request, res: Response, next: NextFunction) {
-    try {
-      const payload = req.body;
-      if (!this.validatePayload(payload)) {
-        res.status(400).json({ error: 'Invalid payload' });
-        return;
-      }
-
-      const cacheKey = `${payload.clientId}:${payload.timestamp}`;
-      this.cache.set(cacheKey, payload.matrix);
-
-      const jobId = randomUUID();
-      await this.queue.add('process-correlation', payload, { jobId });
-
-      res.status(202).json({ jobId });
+      return result;
     } catch (err) {
-      next(err);
+      const ws = wsClients.get(userId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            jobId,
+            status: 'failed',
+            error: (err as Error).message,
+          })
+        );
+      }
+      throw err;
     }
-  }
+  },
+  { connection: redisConnection }
+);
 
-  // BullMQ job processor
-  private async processJob(job: Job<CorrelationMatrixPayload>) {
-    const { clientId, timestamp, matrix } = job.data;
+taskWorker.on('failed', (job, err) => {
+  console.error(`Job ${job.id} failed:`, err);
+});
 
-    // Simulated processing: compute sum of all elements (example)
-    // Formula: Σ_{i=1}^{n} Σ_{j=1}^{n} matrix[i][j]
-    const total = matrix.reduce((accRow, row) => accRow + row.reduce((acc, val) => acc + val, 0), 0);
+/**
+ * Express application setup.
+ */
+const app = express();
+app.use(bodyParser.json());
+app.use(apiLimiter);
 
-    // Simulate async work
-    await new Promise((resolve) => setTimeout(resolve, 500));
+/**
+ * POST /tasks
+ * Authenticated endpoint that enqueues a new task.
+ */
+app.post(
+  '/tasks',
+  authenticateJWT,
+  async (req: AuthenticatedRequest, res: Response) => {
+    const validation = validateTaskPayload(req.body);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
 
-    const result = {
-      clientId,
-      timestamp,
-      total,
-      processedAt: new Date().toISOString(),
-    };
-    return result;
-  }
+    const userId = req.user!.id;
+    const jobId = `${userId}-${Date.now()}-${Math.random()
+      .toString(36)
+      .substring(2, 8)}`;
 
-  // WebSocket connection handler
-  private handleWsConnection(ws: WebSocket) {
-    this.wsClients.add(ws);
-    ws.on('close', () => {
-      this.wsClients.delete(ws);
-    });
-  }
-
-  // Emit event to all connected WebSocket clients
-  private emitWsEvent(event: string, data: any) {
-    const message = JSON.stringify({ event, data });
-    for (const client of this.wsClients) {
-      if (client.readyState === WebSocket.OPEN) {
+    try {
+      await taskQueue.add(
+        'process',
+        { task: req.body, userId, jobId },
+        { jobId }
+      );
+      return res.status(202).json({ jobId, status: 'queued' });
+    } catch (err) {
+      console.error('Failed to
