@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation API Gateway**](./projects/anomaly-correlation-api-gateway/) | `Data Science` | Node.js / TypeScript | Unified REST gateway for dashboard, orchestrator, and explainability services. |
 | [**Anomaly Correlation Explainability Service**](./projects/anomaly-correlation-explainability/) | `Data Science` | Node.js / TypeScript | Generates interpretable explanations for detected anomalies. |
 | [**Anomaly Correlation Aggregator**](./projects/anomaly-correlation-aggregator/) | `Data Science` | Node.js, TypeScript, TensorFlow.js | Aggregates multi‑sensor anomalies using Kalman filter and DBSCAN. |
 | [**Anomaly Correlation Evaluation Service**](./projects/anomaly-correlation-evaluator/) | `Data Science` | TypeScript / Node.js | Computes cross‑validated metrics and visual reports for anomaly detection pipelines. |
