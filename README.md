@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Alert Service**](./projects/anomaly-correlation-alert-service/) | `Data Science` | Node.js / TypeScript | Real‑time alerting with Bayesian scoring and WebSocket notifications. |
 | [**Anomaly Correlation ML Service**](./projects/anomaly-correlation-ml-service/) | `Data Science` | Node.js / Python | ML microservice for real‑time anomaly detection and correlation. |
 | [**Anomaly Correlation API Gateway**](./projects/anomaly-correlation-api-gateway/) | `Data Science` | Node.js / TypeScript | Unified REST gateway for dashboard, orchestrator, and explainability services. |
 | [**Anomaly Correlation Explainability Service**](./projects/anomaly-correlation-explainability/) | `Data Science` | Node.js / TypeScript | Generates interpretable explanations for detected anomalies. |
