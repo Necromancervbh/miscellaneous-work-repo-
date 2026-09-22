@@ -1,193 +1,205 @@
-import express, { Request, Response, NextFunction } from 'express';
-import rateLimit from 'express-rate-limit';
-import jwt from 'jsonwebtoken';
-import { Queue, Worker, QueueScheduler, Job } from 'bullmq';
-import IORedis from 'ioredis';
-import { Server as WebSocketServer, WebSocket } from 'ws';
+import { EventEmitter } from 'events';
+import WebSocket, { WebSocketServer } from 'ws';
 import http from 'http';
-import bodyParser from 'body-parser';
-import { schedule as scheduleTask } from './scheduler';
-import { aggregate as aggregateResults } from './aggregator';
-import { explain as explainResults } from './explainability';
-import { evaluate as evaluateResults } from './evaluator';
-import dotenv from 'dotenv';
-
-dotenv.config();
-
-const JWT_SECRET = process.env.JWT_SECRET || 'default_secret';
-const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-const PORT = parseInt(process.env.PORT || '3000', 10);
+import { setInterval, clearInterval } from 'timers';
 
 /**
- * Interface extending Express Request to include authenticated user payload.
+ * Types
  */
-interface AuthenticatedRequest extends Request {
-  user?: { id: string; [key: string]: any };
+type AlertSource = 'kalman' | 'bayesian';
+
+interface Alert {
+  clientId: string;
+  timestamp: number; // epoch ms
+  metric: string;
+  value: number;
+  source: AlertSource;
+}
+
+interface AggregatedAnomaly {
+  clientId: string;
+  metric: string;
+  latestValue: number;
+  lastTimestamp: number;
+  sources: Set<AlertSource>;
 }
 
 /**
- * JWT authentication middleware.
- * Verifies token and attaches payload to request object.
+ * Token bucket implementation for rate limiting.
+ * Formula: tokens = min(capacity, tokens + refillRate * dt)
+ * where dt is time elapsed in seconds.
  */
-function authenticateJWT(
-  req: AuthenticatedRequest,
-  res: Response,
-  next: NextFunction
-) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    return res.status(401).json({ error: 'Authorization header missing' });
-  }
+class TokenBucket {
+  private capacity: number;
+  private tokens: number;
+  private refillRate: number; // tokens per second
+  private lastRefill: number; // epoch ms
 
-  const token = authHeader.split(' ')[1];
-  if (!token) {
-    return res.status(401).json({ error: 'Bearer token missing' });
-  }
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET) as { id: string };
-    req.user = payload;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
-}
-
-/**
- * Rate limiter: max 60 requests per minute per IP.
- */
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  message: { error: 'Too many requests, please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-/**
- * Redis connection for BullMQ.
- */
-const redisConnection = new IORedis(REDIS_URL);
-
-/**
- * BullMQ queue and scheduler for task processing.
- */
-const taskQueue = new Queue('tasks', { connection: redisConnection });
-const taskQueueScheduler = new QueueScheduler('tasks', {
-  connection: redisConnection,
-});
-
-/**
- * In‑memory map of userId => WebSocket connection.
- * Used to push results back to the originating client.
- */
-const wsClients = new Map<string, WebSocket>();
-
-/**
- * Helper to validate incoming task payload.
- */
-function validateTaskPayload(payload: any): { valid: boolean; error?: string } {
-  if (typeof payload !== 'object' || payload === null) {
-    return { valid: false, error: 'Payload must be a JSON object' };
-  }
-  if (!payload.type || typeof payload.type !== 'string') {
-    return { valid: false, error: 'Missing or invalid "type" field' };
-  }
-  // Additional domain‑specific validation can be added here.
-  return { valid: true };
-}
-
-/**
- * Core processing pipeline.
- * Executes scheduler, aggregator, explainability, and evaluator sequentially.
- * Returns a combined result object.
- */
-async function processTask(task: any, userId: string, jobId: string) {
-  // Scheduler may produce a schedule object.
-  const scheduleResult = await scheduleTask(task);
-  // Aggregator consumes schedule result.
-  const aggregationResult = await aggregateResults(scheduleResult);
-  // Explainability consumes aggregation result.
-  const explanationResult = await explainResults(aggregationResult);
-  // Evaluator consumes explanation result.
-  const evaluationResult = await evaluateResults(explanationResult);
-
-  return {
-    schedule: scheduleResult,
-    aggregation: aggregationResult,
-    explanation: explanationResult,
-    evaluation: evaluationResult,
-    meta: { userId, jobId },
-  };
-}
-
-/**
- * BullMQ worker that processes queued tasks.
- * After processing, pushes result to the user's WebSocket if connected.
- */
-const taskWorker = new Worker(
-  'tasks',
-  async (job: Job) => {
-    const { task, userId, jobId } = job.data;
-    try {
-      const result = await processTask(task, userId, jobId);
-      const ws = wsClients.get(userId);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ jobId, status: 'completed', result }));
-      }
-      return result;
-    } catch (err) {
-      const ws = wsClients.get(userId);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            jobId,
-            status: 'failed',
-            error: (err as Error).message,
-          })
-        );
-      }
-      throw err;
+  constructor(capacity: number, refillRate: number) {
+    if (capacity <= 0 || refillRate <= 0) {
+      throw new Error('TokenBucket parameters must be positive numbers.');
     }
-  },
-  { connection: redisConnection }
-);
+    this.capacity = capacity;
+    this.tokens = capacity;
+    this.refillRate = refillRate;
+    this.lastRefill = Date.now();
+  }
 
-taskWorker.on('failed', (job, err) => {
-  console.error(`Job ${job.id} failed:`, err);
-});
+  /**
+   * Attempt to consume a token.
+   * @returns true if token was consumed, false otherwise.
+   */
+  public tryConsume(): boolean {
+    this.refill();
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
+    }
+    return false;
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    const elapsedSec = (now - this.lastRefill) / 1000;
+    if (elapsedSec <= 0) return;
+    const added = elapsedSec * this.refillRate;
+    this.tokens = Math.min(this.capacity, this.tokens + added);
+    this.lastRefill = now;
+  }
+}
 
 /**
- * Express application setup.
+ * RateLimiter maintains a token bucket per client.
  */
-const app = express();
-app.use(bodyParser.json());
-app.use(apiLimiter);
+class RateLimiter {
+  private buckets: Map<string, TokenBucket>;
+  private capacity: number;
+  private refillRate: number;
+
+  constructor(capacity: number, refillRate: number) {
+    this.buckets = new Map();
+    this.capacity = capacity;
+    this.refillRate = refillRate;
+  }
+
+  public canSend(clientId: string): boolean {
+    let bucket = this.buckets.get(clientId);
+    if (!bucket) {
+      bucket = new TokenBucket(this.capacity, this.refillRate);
+      this.buckets.set(clientId, bucket);
+    }
+    return bucket.tryConsume();
+  }
+
+  public removeClient(clientId: string): void {
+    this.buckets.delete(clientId);
+  }
+}
 
 /**
- * POST /tasks
- * Authenticated endpoint that enqueues a new task.
+ * Aggregator merges alerts into per‑client, per‑metric anomalies.
  */
-app.post(
-  '/tasks',
-  authenticateJWT,
-  async (req: AuthenticatedRequest, res: Response) => {
-    const validation = validateTaskPayload(req.body);
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.error });
+class Aggregator extends EventEmitter {
+  private anomalies: Map<string, Map<string, AggregatedAnomaly>>; // clientId -> metric -> anomaly
+
+  constructor() {
+    super();
+    this.anomalies = new Map();
+  }
+
+  public processAlert(alert: Alert): void {
+    if (!alert.clientId || !alert.metric) {
+      // Invalid alert, ignore but log
+      console.warn('Received malformed alert:', alert);
+      return;
     }
 
-    const userId = req.user!.id;
-    const jobId = `${userId}-${Date.now()}-${Math.random()
-      .toString(36)
-      .substring(2, 8)}`;
+    let clientMap = this.anomalies.get(alert.clientId);
+    if (!clientMap) {
+      clientMap = new Map();
+      this.anomalies.set(alert.clientId, clientMap);
+    }
 
-    try {
-      await taskQueue.add(
-        'process',
-        { task: req.body, userId, jobId },
-        { jobId }
-      );
-      return res.status(202).json({ jobId, status: 'queued' });
-    } catch (err) {
-      console.error('Failed to
+    let agg = clientMap.get(alert.metric);
+    if (!agg) {
+      agg = {
+        clientId: alert.clientId,
+        metric: alert.metric,
+        latestValue: alert.value,
+        lastTimestamp: alert.timestamp,
+        sources: new Set([alert.source]),
+      };
+      clientMap.set(alert.metric, agg);
+      this.emit('anomaly', agg);
+      return;
+    }
+
+    // Update if newer timestamp
+    if (alert.timestamp > agg.lastTimestamp) {
+      agg.latestValue = alert.value;
+      agg.lastTimestamp = alert.timestamp;
+    }
+    agg.sources.add(alert.source);
+    this.emit('anomaly', agg);
+  }
+
+  public getAnomaly(clientId: string, metric: string): AggregatedAnomaly | undefined {
+    return this.anomalies.get(clientId)?.get(metric);
+  }
+}
+
+/**
+ * WebSocket multiplexing server.
+ * Clients send a JSON message: { type: 'subscribe', clientId: string }
+ * Server sends: { type: 'anomaly', data: AggregatedAnomaly }
+ */
+class MultiplexedWSServer {
+  private wss: WebSocketServer;
+  private clientSubscriptions: Map<string, Set<WebSocket>>; // clientId -> connections
+  private rateLimiter: RateLimiter;
+
+  constructor(server: http.Server, rateLimiter: RateLimiter) {
+    this.wss = new WebSocketServer({ server });
+    this.clientSubscriptions = new Map();
+    this.rateLimiter = rateLimiter;
+
+    this.wss.on('connection', (ws: WebSocket) => this.handleConnection(ws));
+    this.wss.on('error', (err) => {
+      console.error('WebSocket server error:', err);
+    });
+  }
+
+  private handleConnection(ws: WebSocket): void {
+    const subscribedClients = new Set<string>();
+
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'subscribe' && typeof msg.clientId === 'string') {
+          const clientId = msg.clientId.trim();
+          if (!clientId) {
+            ws.send(JSON.stringify({ type: 'error', message: 'clientId cannot be empty' }));
+            return;
+          }
+          let set = this.clientSubscriptions.get(clientId);
+          if (!set) {
+            set = new Set();
+            this.clientSubscriptions.set(clientId, set);
+          }
+          set.add(ws);
+          subscribedClients.add(clientId);
+        } else {
+          ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+        }
+      } catch (e) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Failed to parse message' }));
+      }
+    });
+
+    ws.on('close', () => {
+      for (const clientId of subscribedClients) {
+        const set = this.clientSubscriptions.get(clientId);
+        if (set) {
+          set.delete(ws);
+          if (set.size === 0) {
+            this.clientSubscriptions
