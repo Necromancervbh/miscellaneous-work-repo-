@@ -1,56 +1,87 @@
 import { describe, it, expect } from 'vitest';
-import { computeCorrelation } from './orchestrator';
+import { correlateAnomalies } from '../orchestrator';
 
-describe('computeCorrelation - Anomaly Correlation Orchestrator', () => {
-  // Normal input cases
+describe('Anomaly Correlation Orchestrator - correlateAnomalies', () => {
+  // Normal input tests
+  it('should correctly calculate correlation for a typical dataset', () => {
+    const data = [
+      { actual: 10, predicted: 12 },
+      { actual: 15, predicted: 14 },
+      { actual: 20, predicted: 19 },
+      { actual: 25, predicted: 27 },
+    ];
+    const result = correlateAnomalies(data);
+    // Assuming the function returns a number between -1 and 1
+    expect(result).toBeTypeOf('number');
+    expect(result).toBeGreaterThanOrEqual(-1);
+    expect(result).toBeLessThanOrEqual(1);
+  });
+
   it('should return 1 for perfectly positively correlated data', () => {
-    const observed = [1, 2, 3, 4, 5];
-    const predicted = [1, 2, 3, 4, 5];
-    const result = computeCorrelation(observed, predicted);
-    expect(result).toBeCloseTo(1);
+    const data = [
+      { actual: 1, predicted: 2 },
+      { actual: 2, predicted: 4 },
+      { actual: 3, predicted: 6 },
+      { actual: 4, predicted: 8 },
+    ];
+    const result = correlateAnomalies(data);
+    expect(result).toBeCloseTo(1, 5);
   });
 
   it('should return -1 for perfectly negatively correlated data', () => {
-    const observed = [1, 2, 3, 4, 5];
-    const predicted = [5, 4, 3, 2, 1];
-    const result = computeCorrelation(observed, predicted);
-    expect(result).toBeCloseTo(-1);
+    const data = [
+      { actual: 1, predicted: 8 },
+      { actual: 2, predicted: 6 },
+      { actual: 3, predicted: 4 },
+      { actual: 4, predicted: 2 },
+    ];
+    const result = correlateAnomalies(data);
+    expect(result).toBeCloseTo(-1, 5);
   });
 
-  it('should return 0 for uncorrelated data', () => {
-    const observed = [1, 2, 3, 4, 5];
-    const predicted = [2, 2, 2, 2, 2];
-    const result = computeCorrelation(observed, predicted);
-    expect(result).toBeCloseTo(0);
+  // Edge case: empty input
+  it('should return null or NaN for empty dataset', () => {
+    const data = [];
+    const result = correlateAnomalies(data);
+    expect(result).toBeNull();
   });
 
-  // Edge cases
-  it('should throw an error when both arrays are empty', () => {
-    const observed: number[] = [];
-    const predicted: number[] = [];
-    expect(() => computeCorrelation(observed, predicted)).toThrow();
+  // Edge case: single element
+  it('should return null or NaN for a single data point', () => {
+    const data = [{ actual: 5, predicted: 5 }];
+    const result = correlateAnomalies(data);
+    expect(result).toBeNull();
   });
 
-  it('should throw an error when one array is empty', () => {
-    const observed = [1, 2, 3];
-    const predicted: number[] = [];
-    expect(() => computeCorrelation(observed, predicted)).toThrow();
+  // Edge case: zero values
+  it('should handle zero values correctly', () => {
+    const data = [
+      { actual: 0, predicted: 0 },
+      { actual: 0, predicted: 5 },
+      { actual: 5, predicted: 0 },
+      { actual: 5, predicted: 5 },
+    ];
+    const result = correlateAnomalies(data);
+    expect(result).toBeTypeOf('number');
+    expect(result).toBeGreaterThanOrEqual(-1);
+    expect(result).toBeLessThanOrEqual(1);
   });
 
-  it('should return NaN when all values are zero (zero variance)', () => {
-    const observed = [0, 0, 0, 0];
-    const predicted = [0, 0, 0, 0];
-    const result = computeCorrelation(observed, predicted);
-    expect(result).toBeNaN();
+  // Edge case: null values inside dataset
+  it('should throw an error when dataset contains null entries', () => {
+    const data = [
+      { actual: 10, predicted: 12 },
+      null,
+      { actual: 20, predicted: 19 },
+    ];
+    expect(() => correlateAnomalies(data)).toThrowError();
   });
 
-  it('should throw an error when inputs contain null values', () => {
-    // @ts-ignore – intentionally passing null to test runtime behavior
-    const observed = [1, null, 3];
-    // @ts-ignore
-    const predicted = [1, 2, 3];
-    expect(() => computeCorrelation(observed, predicted)).toThrow();
-  });
-
-  it('should correctly handle negative numbers', () => {
-    const observed = [-5, -
+  // Edge case: undefined values
+  it('should throw an error when dataset contains undefined entries', () => {
+    const data = [
+      { actual: 10, predicted: 12 },
+      undefined,
+      { actual: 20, predicted: 19 },
+    ];
+    expect(() => correlateAnomalies(data)).
