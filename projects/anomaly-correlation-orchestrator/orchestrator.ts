@@ -1,205 +1,212 @@
-import { EventEmitter } from 'events';
-import WebSocket, { WebSocketServer } from 'ws';
+import express, { Request, Response, NextFunction, Application } from 'express';
+import { json } from 'body-parser';
+import jwt, { JwtPayload } from 'jsonwebtoken';
+import { Queue, Worker, Job } from 'bullmq';
+import IORedis from 'ioredis';
+import LRUCache from 'lru-cache';
+import { RateLimiterMemory } from 'rate-limiter-flexible';
+import { Server as WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
-import { setInterval, clearInterval } from 'timers';
+import { v4 as uuidv4 } from 'uuid';
+import { analytics } from './modules/analytics';
+import { forecasting } from './modules/forecasting';
+import { insight } from './modules/insight';
+import { alert } from './modules/alert';
 
-/**
- * Types
- */
-type AlertSource = 'kalman' | 'bayesian';
+// -------------------- Configuration --------------------
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const PORT = Number(process.env.PORT) || 3000;
 
-interface Alert {
-  clientId: string;
-  timestamp: number; // epoch ms
-  metric: string;
-  value: number;
-  source: AlertSource;
+// LRU Cache configuration: max 500 items, max age 10 minutes
+const resultCache = new LRUCache<string, any>({
+  max: 500,
+  ttl: 1000 * 60 * 10, // 10 minutes
+});
+
+// Rate limiter for alerts: max 5 alerts per minute per user
+const alertRateLimiter = new RateLimiterMemory({
+  points: 5,
+  duration: 60,
+});
+
+// -------------------- Types --------------------
+interface AuthenticatedRequest extends Request {
+  user?: JwtPayload & { sub: string };
 }
 
-interface AggregatedAnomaly {
-  clientId: string;
-  metric: string;
-  latestValue: number;
-  lastTimestamp: number;
-  sources: Set<AlertSource>;
+interface AnomalyRequestBody {
+  data: number[];
+  meta?: Record<string, any>;
 }
 
-/**
- * Token bucket implementation for rate limiting.
- * Formula: tokens = min(capacity, tokens + refillRate * dt)
- * where dt is time elapsed in seconds.
- */
-class TokenBucket {
-  private capacity: number;
-  private tokens: number;
-  private refillRate: number; // tokens per second
-  private lastRefill: number; // epoch ms
+// -------------------- Middleware --------------------
+function requestLogger(req: Request, _res: Response, next: NextFunction): void {
+  console.info(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+}
 
-  constructor(capacity: number, refillRate: number) {
-    if (capacity <= 0 || refillRate <= 0) {
-      throw new Error('TokenBucket parameters must be positive numbers.');
-    }
-    this.capacity = capacity;
-    this.tokens = capacity;
-    this.refillRate = refillRate;
-    this.lastRefill = Date.now();
+function authenticateJWT(req: AuthenticatedRequest, _res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return next({ status: 401, message: 'Missing or malformed Authorization header' });
   }
-
-  /**
-   * Attempt to consume a token.
-   * @returns true if token was consumed, false otherwise.
-   */
-  public tryConsume(): boolean {
-    this.refill();
-    if (this.tokens >= 1) {
-      this.tokens -= 1;
-      return true;
-    }
-    return false;
-  }
-
-  private refill(): void {
-    const now = Date.now();
-    const elapsedSec = (now - this.lastRefill) / 1000;
-    if (elapsedSec <= 0) return;
-    const added = elapsedSec * this.refillRate;
-    this.tokens = Math.min(this.capacity, this.tokens + added);
-    this.lastRefill = now;
+  const token = authHeader.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as JwtPayload & { sub: string };
+    req.user = payload;
+    next();
+  } catch (err) {
+    next({ status: 401, message: 'Invalid token' });
   }
 }
 
-/**
- * RateLimiter maintains a token bucket per client.
- */
-class RateLimiter {
-  private buckets: Map<string, TokenBucket>;
-  private capacity: number;
-  private refillRate: number;
-
-  constructor(capacity: number, refillRate: number) {
-    this.buckets = new Map();
-    this.capacity = capacity;
-    this.refillRate = refillRate;
-  }
-
-  public canSend(clientId: string): boolean {
-    let bucket = this.buckets.get(clientId);
-    if (!bucket) {
-      bucket = new TokenBucket(this.capacity, this.refillRate);
-      this.buckets.set(clientId, bucket);
-    }
-    return bucket.tryConsume();
-  }
-
-  public removeClient(clientId: string): void {
-    this.buckets.delete(clientId);
-  }
+// Centralized error handler
+function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction): void {
+  const status = err.status || 500;
+  const message = err.message || 'Internal Server Error';
+  console.error(`[Error] ${status} - ${message}`, err.stack);
+  res.status(status).json({ error: message });
 }
 
-/**
- * Aggregator merges alerts into per‑client, per‑metric anomalies.
- */
-class Aggregator extends EventEmitter {
-  private anomalies: Map<string, Map<string, AggregatedAnomaly>>; // clientId -> metric -> anomaly
+// -------------------- Orchestrator Service --------------------
+export class OrchestratorService {
+  private app: Application;
+  private server: http.Server;
+  private wss: WebSocketServer;
+  private queue: Queue;
+  private worker: Worker;
+  private redisConnection: IORedis.Redis;
 
   constructor() {
-    super();
-    this.anomalies = new Map();
+    this.app = express();
+    this.server = http.createServer(this.app);
+    this.wss = new WebSocketServer({ server: this.server });
+    this.redisConnection = new IORedis(REDIS_URL);
+    this.queue = new Queue('anomaly-jobs', { connection: this.redisConnection });
+
+    this.configureMiddleware();
+    this.registerRoutes();
+    this.configureWebSocket();
+    this.configureWorker();
+    this.handleProcessSignals();
   }
 
-  public processAlert(alert: Alert): void {
-    if (!alert.clientId || !alert.metric) {
-      // Invalid alert, ignore but log
-      console.warn('Received malformed alert:', alert);
-      return;
-    }
+  // -------------------- Middleware Setup --------------------
+  private configureMiddleware(): void {
+    this.app.use(requestLogger);
+    this.app.use(json({ limit: '1mb' }));
+    this.app.use(authenticateJWT);
+    this.app.use(errorHandler);
+  }
 
-    let clientMap = this.anomalies.get(alert.clientId);
-    if (!clientMap) {
-      clientMap = new Map();
-      this.anomalies.set(alert.clientId, clientMap);
-    }
+  // -------------------- Routes --------------------
+  private registerRoutes(): void {
+    this.app.post('/anomaly', this.handleAnomalyRequest.bind(this));
+    this.app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+  }
 
-    let agg = clientMap.get(alert.metric);
-    if (!agg) {
-      agg = {
-        clientId: alert.clientId,
-        metric: alert.metric,
-        latestValue: alert.value,
-        lastTimestamp: alert.timestamp,
-        sources: new Set([alert.source]),
+  private async handleAnomalyRequest(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+    try {
+      // Input validation
+      const body: Partial<AnomalyRequestBody> = req.body;
+      if (!body || !Array.isArray(body.data) || body.data.length === 0) {
+        throw { status: 400, message: 'Invalid request: "data" must be a non‑empty array of numbers' };
+      }
+      if (!body.data.every((v) => typeof v === 'number')) {
+        throw { status: 400, message: '"data" array must contain only numbers' };
+      }
+
+      const jobId = uuidv4();
+      const payload = {
+        jobId,
+        userId: req.user?.sub,
+        data: body.data,
+        meta: body.meta || {},
       };
-      clientMap.set(alert.metric, agg);
-      this.emit('anomaly', agg);
-      return;
+
+      // Enqueue job
+      await this.queue.add('process-anomaly', payload, { jobId });
+
+      res.status(202).json({ jobId, status: 'queued' });
+    } catch (err) {
+      next(err);
     }
-
-    // Update if newer timestamp
-    if (alert.timestamp > agg.lastTimestamp) {
-      agg.latestValue = alert.value;
-      agg.lastTimestamp = alert.timestamp;
-    }
-    agg.sources.add(alert.source);
-    this.emit('anomaly', agg);
   }
 
-  public getAnomaly(clientId: string, metric: string): AggregatedAnomaly | undefined {
-    return this.anomalies.get(clientId)?.get(metric);
-  }
-}
-
-/**
- * WebSocket multiplexing server.
- * Clients send a JSON message: { type: 'subscribe', clientId: string }
- * Server sends: { type: 'anomaly', data: AggregatedAnomaly }
- */
-class MultiplexedWSServer {
-  private wss: WebSocketServer;
-  private clientSubscriptions: Map<string, Set<WebSocket>>; // clientId -> connections
-  private rateLimiter: RateLimiter;
-
-  constructor(server: http.Server, rateLimiter: RateLimiter) {
-    this.wss = new WebSocketServer({ server });
-    this.clientSubscriptions = new Map();
-    this.rateLimiter = rateLimiter;
-
-    this.wss.on('connection', (ws: WebSocket) => this.handleConnection(ws));
-    this.wss.on('error', (err) => {
-      console.error('WebSocket server error:', err);
-    });
-  }
-
-  private handleConnection(ws: WebSocket): void {
-    const subscribedClients = new Set<string>();
-
-    ws.on('message', (data) => {
+  // -------------------- WebSocket --------------------
+  private configureWebSocket(): void {
+    this.wss.on('connection', (ws: WebSocket, req) => {
+      const token = new URLSearchParams(req.url?.split('?')[1] || '').get('token');
+      if (!token) {
+        ws.close(4001, 'Missing token');
+        return;
+      }
       try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'subscribe' && typeof msg.clientId === 'string') {
-          const clientId = msg.clientId.trim();
-          if (!clientId) {
-            ws.send(JSON.stringify({ type: 'error', message: 'clientId cannot be empty' }));
-            return;
-          }
-          let set = this.clientSubscriptions.get(clientId);
-          if (!set) {
-            set = new Set();
-            this.clientSubscriptions.set(clientId, set);
-          }
-          set.add(ws);
-          subscribedClients.add(clientId);
-        } else {
-          ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
-        }
-      } catch (e) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Failed to parse message' }));
+        const payload = jwt.verify(token, JWT_SECRET) as JwtPayload & { sub: string };
+        (ws as any).userId = payload.sub;
+        ws.send(JSON.stringify({ type: 'welcome', userId: payload.sub }));
+      } catch {
+        ws.close(4002, 'Invalid token');
       }
     });
+  }
 
-    ws.on('close', () => {
-      for (const clientId of subscribedClients) {
-        const set = this.clientSubscriptions.get(clientId);
-        if (set) {
-          set.delete(ws);
-          if (set.size === 0) {
-            this.clientSubscriptions
+  private broadcastResult(userId: string, message: any): void {
+    const data = JSON.stringify(message);
+    this.wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN && (client as any).userId === userId) {
+        client.send(data);
+      }
+    });
+  }
+
+  // -------------------- Worker --------------------
+  private configureWorker(): void {
+    this.worker = new Worker(
+      'anomaly-jobs',
+      async (job: Job) => {
+        const { jobId, userId, data, meta } = job.data as {
+          jobId: string;
+          userId: string;
+          data: number[];
+          meta: Record<string, any>;
+        };
+
+        // Check cache first
+        const cacheKey = `${userId}:${jobId}`;
+        if (resultCache.has(cacheKey)) {
+          return resultCache.get(cacheKey);
+        }
+
+        // Run analytics pipeline
+        const analyticsResult = await analytics(data);
+        const forecastResult = await forecasting(analyticsResult);
+        const insightResult = await insight(forecastResult);
+        const alertResult = await alert(insightResult);
+
+        // Rate‑limit alerts per user
+        try {
+          await alertRateLimiter.consume(userId);
+        } catch {
+          // Exceeded rate limit: suppress alert
+          console.warn(`Alert rate limit exceeded for user ${userId}`);
+        }
+
+        const finalResult = {
+          jobId,
+          userId,
+          analytics: analyticsResult,
+          forecast: forecastResult,
+          insight: insightResult,
+          alert: alertResult,
+          meta,
+        };
+
+        // Cache result
+        resultCache.set(cacheKey, finalResult);
+
+        // Stream via WebSocket
+        this.broadcastResult(userId, { type: 'anomalyResult', payload: finalResult });
+
+        return finalResult
