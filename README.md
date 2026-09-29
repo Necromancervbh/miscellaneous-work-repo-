@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Real‑Time Anomaly Correlation Dashboard**](./projects/anomaly-correlation-realtime-dashboard/) | `Full‑Stack` | Node.js / React / WebSocket | Live UI visualizing anomaly scores and alerts. |
 | [**Anomaly Correlation Analytics Service**](./projects/anomaly-correlation-analytics/) | `Data Science` | Node.js / TypeScript / Python | Aggregates, scores, and visualizes anomaly insights. |
 | [**Anomaly Correlation Alerting Service**](./projects/anomaly-correlation-alerting/) | `Data Science` | Node.js / TypeScript / WebSocket | Real‑time alerts for correlated anomalies across streams. |
 | [**Anomaly Correlation Insight Engine**](./projects/anomaly-correlation-insight-engine/) | `Data Science` | TypeScript / Node.js / TensorFlow.js | Aggregates forecasts, alerts, and visualizations into actionable insights. |
