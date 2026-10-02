@@ -1,212 +1,117 @@
-import express, { Request, Response, NextFunction, Application } from 'express';
-import { json } from 'body-parser';
-import jwt, { JwtPayload } from 'jsonwebtoken';
-import { Queue, Worker, Job } from 'bullmq';
-import IORedis from 'ioredis';
-import LRUCache from 'lru-cache';
-import { RateLimiterMemory } from 'rate-limiter-flexible';
-import { Server as WebSocketServer, WebSocket } from 'ws';
-import http from 'http';
-import { v4 as uuidv4 } from 'uuid';
-import { analytics } from './modules/analytics';
-import { forecasting } from './modules/forecasting';
-import { insight } from './modules/insight';
-import { alert } from './modules/alert';
+import { Queue, QueueScheduler, Worker, Job, QueueEvents, JobsOptions } from 'bullmq';
+import IORedis, { RedisOptions } from 'ioredis';
+import { randomUUID } from 'crypto';
 
-// -------------------- Configuration --------------------
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const PORT = Number(process.env.PORT) || 3000;
-
-// LRU Cache configuration: max 500 items, max age 10 minutes
-const resultCache = new LRUCache<string, any>({
-  max: 500,
-  ttl: 1000 * 60 * 10, // 10 minutes
-});
-
-// Rate limiter for alerts: max 5 alerts per minute per user
-const alertRateLimiter = new RateLimiterMemory({
-  points: 5,
-  duration: 60,
-});
-
-// -------------------- Types --------------------
-interface AuthenticatedRequest extends Request {
-  user?: JwtPayload & { sub: string };
+/**
+ * Enum representing the type of a task in the DAG.
+ */
+export enum TaskType {
+  ANALYTICS = 'analytics',
+  PREDICTION = 'prediction',
+  ALERT = 'alert',
 }
 
-interface AnomalyRequestBody {
-  data: number[];
-  meta?: Record<string, any>;
+/**
+ * Interface describing a generic task.
+ */
+export interface Task {
+  /** Unique identifier for the task */
+  id: string;
+  /** Type of the task */
+  type: TaskType;
+  /** Arbitrary payload required for execution */
+  payload: any;
+  /** List of task IDs that must complete before this task runs */
+  dependencies?: string[];
 }
 
-// -------------------- Middleware --------------------
-function requestLogger(req: Request, _res: Response, next: NextFunction): void {
-  console.info(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
-  next();
-}
-
-function authenticateJWT(req: AuthenticatedRequest, _res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    return next({ status: 401, message: 'Missing or malformed Authorization header' });
-  }
-  const token = authHeader.split(' ')[1];
-  try {
-    const payload = jwt.verify(token, JWT_SECRET) as JwtPayload & { sub: string };
-    req.user = payload;
-    next();
-  } catch (err) {
-    next({ status: 401, message: 'Invalid token' });
-  }
-}
-
-// Centralized error handler
-function errorHandler(err: any, _req: Request, res: Response, _next: NextFunction): void {
-  const status = err.status || 500;
-  const message = err.message || 'Internal Server Error';
-  console.error(`[Error] ${status} - ${message}`, err.stack);
-  res.status(status).json({ error: message });
-}
-
-// -------------------- Orchestrator Service --------------------
-export class OrchestratorService {
-  private app: Application;
-  private server: http.Server;
-  private wss: WebSocketServer;
-  private queue: Queue;
-  private worker: Worker;
-  private redisConnection: IORedis.Redis;
-
-  constructor() {
-    this.app = express();
-    this.server = http.createServer(this.app);
-    this.wss = new WebSocketServer({ server: this.server });
-    this.redisConnection = new IORedis(REDIS_URL);
-    this.queue = new Queue('anomaly-jobs', { connection: this.redisConnection });
-
-    this.configureMiddleware();
-    this.registerRoutes();
-    this.configureWebSocket();
-    this.configureWorker();
-    this.handleProcessSignals();
-  }
-
-  // -------------------- Middleware Setup --------------------
-  private configureMiddleware(): void {
-    this.app.use(requestLogger);
-    this.app.use(json({ limit: '1mb' }));
-    this.app.use(authenticateJWT);
-    this.app.use(errorHandler);
-  }
-
-  // -------------------- Routes --------------------
-  private registerRoutes(): void {
-    this.app.post('/anomaly', this.handleAnomalyRequest.bind(this));
-    this.app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-  }
-
-  private async handleAnomalyRequest(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      // Input validation
-      const body: Partial<AnomalyRequestBody> = req.body;
-      if (!body || !Array.isArray(body.data) || body.data.length === 0) {
-        throw { status: 400, message: 'Invalid request: "data" must be a non‑empty array of numbers' };
-      }
-      if (!body.data.every((v) => typeof v === 'number')) {
-        throw { status: 400, message: '"data" array must contain only numbers' };
-      }
-
-      const jobId = uuidv4();
-      const payload = {
-        jobId,
-        userId: req.user?.sub,
-        data: body.data,
-        meta: body.meta || {},
-      };
-
-      // Enqueue job
-      await this.queue.add('process-anomaly', payload, { jobId });
-
-      res.status(202).json({ jobId, status: 'queued' });
-    } catch (err) {
-      next(err);
+/**
+ * Helper class for Bayesian aggregation of anomaly scores.
+ *
+ * Posterior probability P(A|E) = (P(A) * Π_i L_i) /
+ *   (P(A) * Π_i L_i + (1 - P(A)) * Π_i (1 - L_i))
+ *
+ * where:
+ *   - P(A) is the prior probability (default 0.5)
+ *   - L_i are the likelihoods (individual anomaly scores in [0,1])
+ */
+export class BayesianAggregator {
+  /**
+   * Aggregates a list of anomaly scores into a single posterior probability.
+   *
+   * @param scores Array of anomaly scores (each between 0 and 1)
+   * @param prior Prior probability (default 0.5)
+   * @returns Posterior probability in [0,1]
+   */
+  static aggregate(scores: number[], prior: number = 0.5): number {
+    if (!Array.isArray(scores) || scores.length === 0) {
+      throw new Error('Scores array must contain at least one element.');
     }
-  }
+    if (prior < 0 || prior > 1) {
+      throw new Error('Prior must be between 0 and 1.');
+    }
 
-  // -------------------- WebSocket --------------------
-  private configureWebSocket(): void {
-    this.wss.on('connection', (ws: WebSocket, req) => {
-      const token = new URLSearchParams(req.url?.split('?')[1] || '').get('token');
-      if (!token) {
-        ws.close(4001, 'Missing token');
-        return;
-      }
-      try {
-        const payload = jwt.verify(token, JWT_SECRET) as JwtPayload & { sub: string };
-        (ws as any).userId = payload.sub;
-        ws.send(JSON.stringify({ type: 'welcome', userId: payload.sub }));
-      } catch {
-        ws.close(4002, 'Invalid token');
-      }
-    });
-  }
+    const epsilon = 1e-12; // avoid division by zero
+    const prodLikelihood = scores.reduce((acc, s) => acc * Math.min(Math.max(s, epsilon), 1 - epsilon), 1);
+    const prodNegLikelihood = scores.reduce((acc, s) => acc * Math.min(Math.max(1 - s, epsilon), 1 - epsilon), 1);
 
-  private broadcastResult(userId: string, message: any): void {
-    const data = JSON.stringify(message);
-    this.wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN && (client as any).userId === userId) {
-        client.send(data);
-      }
-    });
-  }
+    const numerator = prior * prodLikelihood;
+    const denominator = numerator + (1 - prior) * prodNegLikelihood;
 
-  // -------------------- Worker --------------------
-  private configureWorker(): void {
+    return denominator === 0 ? 0 : numerator / denominator;
+  }
+}
+
+/**
+ * Orchestrator builds a DAG of tasks, enqueues them using BullMQ,
+ * processes them, stores intermediate results, and finally aggregates
+ * Bayesian anomaly scores.
+ */
+export class Orchestrator {
+  private readonly connection: IORedis;
+  private readonly queue: Queue;
+  private readonly queueScheduler: QueueScheduler;
+  private readonly worker: Worker;
+  private readonly queueEvents: QueueEvents;
+  private readonly resultHashKey = 'task:results';
+  private readonly pendingJobs: Map<string, Job>;
+
+  /**
+   * Constructs an Orchestrator.
+   *
+   * @param redisOptions Options for connecting to Redis.
+   * @param queueName   Name of the BullMQ queue (default: 'anomaly-orchestrator')
+   */
+  constructor(redisOptions: RedisOptions, queueName: string = 'anomaly-orchestrator') {
+    this.connection = new IORedis(redisOptions);
+    this.queue = new Queue(queueName, { connection: this.connection });
+    this.queueScheduler = new QueueScheduler(queueName, { connection: this.connection });
+    this.queueEvents = new QueueEvents(queueName, { connection: this.connection });
+    this.pendingJobs = new Map();
+
+    // Worker processes each job based on its type.
     this.worker = new Worker(
-      'anomaly-jobs',
-      async (job: Job) => {
-        const { jobId, userId, data, meta } = job.data as {
-          jobId: string;
-          userId: string;
-          data: number[];
-          meta: Record<string, any>;
-        };
+      queueName,
+      async (job: Job) => this.processJob(job),
+      {
+        connection: this.connection,
+        concurrency: 5,
+      },
+    );
 
-        // Check cache first
-        const cacheKey = `${userId}:${jobId}`;
-        if (resultCache.has(cacheKey)) {
-          return resultCache.get(cacheKey);
-        }
+    this.worker.on('failed', (job, err) => {
+      console.error(`Job ${job?.id} failed:`, err);
+    });
+  }
 
-        // Run analytics pipeline
-        const analyticsResult = await analytics(data);
-        const forecastResult = await forecasting(analyticsResult);
-        const insightResult = await insight(forecastResult);
-        const alertResult = await alert(insightResult);
+  /**
+   * Adds a collection of tasks to the queue, respecting dependencies.
+   *
+   * @param tasks Array of Task objects.
+   */
+  async addTasks(tasks: Task[]): Promise<void> {
+    this.validateTasks(tasks);
+    const sorted = this.topologicalSort(tasks);
+    const idToJobId = new Map<string, string>();
 
-        // Rate‑limit alerts per user
-        try {
-          await alertRateLimiter.consume(userId);
-        } catch {
-          // Exceeded rate limit: suppress alert
-          console.warn(`Alert rate limit exceeded for user ${userId}`);
-        }
-
-        const finalResult = {
-          jobId,
-          userId,
-          analytics: analyticsResult,
-          forecast: forecastResult,
-          insight: insightResult,
-          alert: alertResult,
-          meta,
-        };
-
-        // Cache result
-        resultCache.set(cacheKey, finalResult);
-
-        // Stream via WebSocket
-        this.broadcastResult(userId, { type: 'anomalyResult', payload: finalResult });
-
-        return finalResult
+    for (const task of sorted) {
