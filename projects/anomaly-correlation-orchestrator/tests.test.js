@@ -1,87 +1,77 @@
 import { describe, it, expect } from 'vitest';
-import { correlateAnomalies } from '../orchestrator';
+import { orchestrate } from './orchestrator';
 
-describe('Anomaly Correlation Orchestrator - correlateAnomalies', () => {
+describe('Anomaly Correlation Orchestrator', () => {
   // Normal input tests
-  it('should correctly calculate correlation for a typical dataset', () => {
-    const data = [
-      { actual: 10, predicted: 12 },
-      { actual: 15, predicted: 14 },
-      { actual: 20, predicted: 19 },
-      { actual: 25, predicted: 27 },
-    ];
-    const result = correlateAnomalies(data);
+  it('should correctly compute correlation for a typical dataset', () => {
+    const input = [0.1, 0.5, 0.3, 0.9, 0.7];
+    const result = orchestrate(input);
     // Assuming the function returns a number between -1 and 1
-    expect(result).toBeTypeOf('number');
+    expect(typeof result).toBe('number');
     expect(result).toBeGreaterThanOrEqual(-1);
     expect(result).toBeLessThanOrEqual(1);
   });
 
-  it('should return 1 for perfectly positively correlated data', () => {
-    const data = [
-      { actual: 1, predicted: 2 },
-      { actual: 2, predicted: 4 },
-      { actual: 3, predicted: 6 },
-      { actual: 4, predicted: 8 },
-    ];
-    const result = correlateAnomalies(data);
-    expect(result).toBeCloseTo(1, 5);
-  });
-
-  it('should return -1 for perfectly negatively correlated data', () => {
-    const data = [
-      { actual: 1, predicted: 8 },
-      { actual: 2, predicted: 6 },
-      { actual: 3, predicted: 4 },
-      { actual: 4, predicted: 2 },
-    ];
-    const result = correlateAnomalies(data);
-    expect(result).toBeCloseTo(-1, 5);
-  });
-
-  // Edge case: empty input
-  it('should return null or NaN for empty dataset', () => {
-    const data = [];
-    const result = correlateAnomalies(data);
-    expect(result).toBeNull();
-  });
-
-  // Edge case: single element
-  it('should return null or NaN for a single data point', () => {
-    const data = [{ actual: 5, predicted: 5 }];
-    const result = correlateAnomalies(data);
-    expect(result).toBeNull();
-  });
-
-  // Edge case: zero values
-  it('should handle zero values correctly', () => {
-    const data = [
-      { actual: 0, predicted: 0 },
-      { actual: 0, predicted: 5 },
-      { actual: 5, predicted: 0 },
-      { actual: 5, predicted: 5 },
-    ];
-    const result = correlateAnomalies(data);
-    expect(result).toBeTypeOf('number');
+  it('should handle a dataset with mixed positive and negative values', () => {
+    const input = [-0.2, 0.4, -0.6, 0.8, -1.0];
+    const result = orchestrate(input);
+    expect(typeof result).toBe('number');
     expect(result).toBeGreaterThanOrEqual(-1);
     expect(result).toBeLessThanOrEqual(1);
   });
 
-  // Edge case: null values inside dataset
-  it('should throw an error when dataset contains null entries', () => {
-    const data = [
-      { actual: 10, predicted: 12 },
-      null,
-      { actual: 20, predicted: 19 },
-    ];
-    expect(() => correlateAnomalies(data)).toThrowError();
+  // Edge case: empty array
+  it('should return 0 (or appropriate neutral value) for an empty array', () => {
+    const input: number[] = [];
+    const result = orchestrate(input);
+    expect(result).toBe(0);
   });
 
-  // Edge case: undefined values
-  it('should throw an error when dataset contains undefined entries', () => {
-    const data = [
-      { actual: 10, predicted: 12 },
-      undefined,
-      { actual: 20, predicted: 19 },
-    ];
-    expect(() => correlateAnomalies(data)).
+  // Edge case: array with a single element
+  it('should return 0 (or appropriate neutral value) for a single-element array', () => {
+    const input = [0.5];
+    const result = orchestrate(input);
+    expect(result).toBe(0);
+  });
+
+  // Edge case: array containing zeros only
+  it('should handle an array of zeros correctly', () => {
+    const input = [0, 0, 0, 0];
+    const result = orchestrate(input);
+    expect(result).toBe(0);
+  });
+
+  // Edge case: null input
+  it('should throw a TypeError when input is null', () => {
+    // @ts-ignore – intentionally passing wrong type
+    expect(() => orchestrate(null)).toThrow(TypeError);
+  });
+
+  // Edge case: undefined input
+  it('should throw a TypeError when input is undefined', () => {
+    // @ts-ignore – intentionally passing wrong type
+    expect(() => orchestrate(undefined)).toThrow(TypeError);
+  });
+
+  // Edge case: negative numbers
+  it('should correctly process an array of negative numbers', () => {
+    const input = [-5, -10, -3, -8];
+    const result = orchestrate(input);
+    expect(typeof result).toBe('number');
+    expect(result).toBeGreaterThanOrEqual(-1);
+    expect(result).toBeLessThanOrEqual(1);
+  });
+
+  // Boundary condition: very large numbers (close to Number.MAX_SAFE_INTEGER)
+  it('should handle very large numbers without overflow', () => {
+    const max = Number.MAX_SAFE_INTEGER;
+    const input = [max, max - 1, max - 2, max - 3];
+    const result = orchestrate(input);
+    expect(typeof result).toBe('number');
+    expect(result).toBeGreaterThanOrEqual(-1);
+    expect(result).toBeLessThanOrEqual(1);
+  });
+
+  // Boundary condition: very small (close to Number.MIN_VALUE) positive numbers
+  it('should handle very small positive numbers correctly', () => {
+    const min = Number.MIN_VALUE;
