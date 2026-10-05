@@ -1,153 +1,148 @@
-import { stl } from 'stl-decomp';
-import * as tf from '@tensorflow/tfjs-node';
+import { TaskQueue, TaskHandler } from 'orchestrator'; // Adjust import path as needed
 
 /**
- * Interface representing a single data point in the time series.
+ * Options for configuring the Kalman filter.
  */
-export interface DataPoint {
-  /** Unix timestamp in milliseconds */
-  timestamp: number;
-  /** Observed value */
-  value: number;
-}
-
-/**
- * Options for configuring the ForecastEngine.
- */
-export interface ForecastEngineOptions {
-  /** Seasonal period (e.g., 24 for hourly data with daily seasonality) */
-  period: number;
-  /** Number of points to keep for STL decomposition (default: period * 2) */
-  windowSize?: number;
-  /** Process variance for the Kalman filter (Q) */
+export interface KalmanFilterOptions {
+  /** Process (model) variance Q. Controls how much we trust the model dynamics. */
   processVariance?: number;
-  /** Measurement variance for the Kalman filter (R) */
+  /** Measurement variance R. Controls how much we trust the observations. */
   measurementVariance?: number;
-  /** Confidence level for prediction intervals (e.g., 0.95 for 95%) */
-  confidenceLevel?: number;
+  /** Initial state estimate x₀. */
+  initialState?: number;
+  /** Initial estimate covariance P₀. */
+  initialCovariance?: number;
 }
 
 /**
- * Result of a forecast request.
+ * Options for the forecasting function.
  */
-export interface ForecastResult {
-  /** Predicted value for the next timestamp */
-  prediction: number;
-  /** Lower bound of the confidence interval */
-  lower: number;
-  /** Upper bound of the confidence interval */
-  upper: number;
-  /** Timestamp for which the prediction is made */
-  timestamp: number;
-}
+export interface ForecastOptions extends KalmanFilterOptions {}
 
 /**
- * Simple 1‑D Kalman filter for scalar trend values.
+ * Scalar Kalman filter for 1‑D time‑series.
  *
- * State equation:      x_k = x_{k-1} + w_k,   w_k ~ N(0, Q)
- * Measurement equation: z_k = x_k + v_k,      v_k ~ N(0, R)
+ * State transition model:   xₖ = xₖ₋₁ + wₖ,   wₖ ~ N(0, Q)
+ * Observation model:       zₖ = xₖ + vₖ,      vₖ ~ N(0, R)
  *
- * The filter maintains the posterior estimate (x̂_k) and its covariance (P_k).
+ * Prediction step:
+ *   x̂ₖ|ₖ₋₁ = x̂ₖ₋₁|ₖ₋₁
+ *   Pₖ|ₖ₋₁ = Pₖ₋₁|ₖ₋₁ + Q
+ *
+ * Update step:
+ *   Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
+ *   x̂ₖ|ₖ = x̂ₖ|ₖ₋₁ + Kₖ (zₖ - x̂ₖ|ₖ₋₁)
+ *   Pₖ|ₖ = (1 - Kₖ) Pₖ|ₖ₋₁
  */
-class KalmanFilter1D {
-  private x: number; // posterior state estimate
-  private P: number; // posterior covariance
-  private readonly Q: number; // process variance
-  private readonly R: number; // measurement variance
+export class KalmanFilter {
+  private x: number; // State estimate (x̂)
+  private P: number; // Estimate covariance (P)
+  private readonly Q: number; // Process variance
+  private readonly R: number; // Measurement variance
+  private initialized: boolean;
 
-  constructor(initialState: number, initialCovariance: number, processVariance: number, measurementVariance: number) {
-    this.x = initialState;
-    this.P = initialCovariance;
+  /**
+   * Creates a new Kalman filter instance.
+   *
+   * @param options Configuration options.
+   */
+  constructor(options: KalmanFilterOptions = {}) {
+    const {
+      processVariance = 1e-5,
+      measurementVariance = 1e-2,
+      initialState = 0,
+      initialCovariance = 1,
+    } = options;
+
+    if (!Number.isFinite(processVariance) || processVariance <= 0) {
+      throw new Error('processVariance must be a positive finite number.');
+    }
+    if (!Number.isFinite(measurementVariance) || measurementVariance <= 0) {
+      throw new Error('measurementVariance must be a positive finite number.');
+    }
+    if (!Number.isFinite(initialState)) {
+      throw new Error('initialState must be a finite number.');
+    }
+    if (!Number.isFinite(initialCovariance) || initialCovariance <= 0) {
+      throw new Error('initialCovariance must be a positive finite number.');
+    }
+
     this.Q = processVariance;
     this.R = measurementVariance;
-  }
-
-  /** Predict step: x̂⁻_k = x̂_{k-1},   P⁻_k = P_{k-1} + Q */
-  predict(): void {
-    this.P = this.P + this.Q;
-    // x remains unchanged (identity state transition)
+    this.x = initialState;
+    this.P = initialCovariance;
+    this.initialized = true;
   }
 
   /**
-   * Update step with measurement z_k.
-   * @param measurement observed trend value
+   * Performs the prediction step and returns the predicted state.
+   *
+   * @returns Predicted state (1‑step ahead forecast).
    */
-  update(measurement: number): void {
-    const K = this.P / (this.P + this.R); // Kalman gain
-    this.x = this.x + K * (measurement - this.x);
-    this.P = (1 - K) * this.P;
-  }
-
-  /** Current posterior state estimate */
-  getState(): number {
+  predict(): number {
+    if (!this.initialized) {
+      throw new Error('Kalman filter not initialized.');
+    }
+    // x̂ₖ|ₖ₋₁ = x̂ₖ₋₁|ₖ₋₁ (identity for constant model)
+    // Pₖ|ₖ₋₁ = Pₖ₋₁|ₖ₋₁ + Q
+    this.P += this.Q;
     return this.x;
   }
 
-  /** Current posterior covariance */
-  getCovariance(): number {
-    return this.P;
+  /**
+   * Incorporates a new measurement into the filter.
+   *
+   * @param measurement Observed value zₖ.
+   */
+  update(measurement: number): void {
+    if (!this.initialized) {
+      throw new Error('Kalman filter not initialized.');
+    }
+    if (!Number.isFinite(measurement)) {
+      throw new Error('Measurement must be a finite number.');
+    }
+
+    // Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
+    const K = this.P / (this.P + this.R);
+
+    // x̂ₖ|ₖ = x̂ₖ|ₖ₋₁ + K (zₖ - x̂ₖ|ₖ₋₁)
+    this.x = this.x + K * (measurement - this.x);
+
+    // Pₖ|ₖ = (1 - K) Pₖ|ₖ₋₁
+    this.P = (1 - K) * this.P;
+  }
+
+  /**
+   * Executes a full filter cycle: predict then update.
+   *
+   * @param measurement New observation.
+   * @returns Predicted state before the measurement was incorporated.
+   */
+  step(measurement: number): number {
+    const prediction = this.predict();
+    this.update(measurement);
+    return prediction;
   }
 }
 
 /**
- * ForecastEngine processes streaming time‑series data, extracts the trend via STL,
- * feeds it into a Kalman filter, and produces point forecasts with confidence intervals.
+ * Generates 1‑step ahead forecasts for a series of anomaly scores.
+ *
+ * @param scores Array of anomaly scores (observations) ordered chronologically.
+ * @param options Optional configuration for the Kalman filter.
+ * @returns Promise that resolves to an array of forecasts, each forecast corresponds to the prediction made before seeing the respective observation.
  */
-export class ForecastEngine {
-  private readonly period: number;
-  private readonly windowSize: number;
-  private readonly kalmanFilter: KalmanFilter1D;
-  private readonly confidenceZ: number; // z‑score for the desired confidence level
-  private readonly dataWindow: DataPoint[] = [];
-  private lastForecast: ForecastResult | null = null;
-
-  /**
-   * @param options configuration parameters
-   */
-  constructor(options: ForecastEngineOptions) {
-    if (!options || typeof options.period !== 'number' || options.period <= 0) {
-      throw new Error('Invalid period: must be a positive number.');
-    }
-    this.period = Math.floor(options.period);
-    this.windowSize = options.windowSize && options.windowSize > this.period
-      ? Math.floor(options.windowSize)
-      : this.period * 2;
-
-    const processVariance = typeof options.processVariance === 'number' && options.processVariance >= 0
-      ? options.processVariance
-      : 1e-3;
-    const measurementVariance = typeof options.measurementVariance === 'number' && options.measurementVariance >= 0
-      ? options.measurementVariance
-      : 1e-2;
-
-    // Initial state: assume zero trend, large uncertainty
-    this.kalmanFilter = new KalmanFilter1D(0, 1e3, processVariance, measurementVariance);
-
-    const confidenceLevel = typeof options.confidenceLevel === 'number' && options.confidenceLevel > 0 && options.confidenceLevel < 1
-      ? options.confidenceLevel
-      : 0.95;
-    // Approximate z‑score for two‑tailed normal distribution
-    this.confidenceZ = this.inverseNormalCdf(0.5 + confidenceLevel / 2);
+export async function forecastAnomalies(
+  scores: number[],
+  options: ForecastOptions = {}
+): Promise<number[]> {
+  // Input validation
+  if (!Array.isArray(scores)) {
+    throw new TypeError('scores must be an array of numbers.');
   }
-
-  /**
-   * Add a new observation to the engine.
-   * @param timestamp Unix timestamp in milliseconds
-   * @param value observed value
-   */
-  addData(timestamp: number, value: number): void {
-    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0) {
-      throw new Error('Invalid timestamp: must be a positive finite number.');
-    }
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-      throw new Error('Invalid value: must be a finite number.');
-    }
-
-    this.dataWindow.push({ timestamp, value });
-    if (this.dataWindow.length > this.windowSize) {
-      this.dataWindow.shift();
-    }
-
-    // Only compute forecast when we have enough points for STL
-    if (this.dataWindow.length >= this.windowSize) {
-      this.compute
+  if (scores.length === 0) {
+    throw new Error('scores array must contain at least one element.');
+  }
+  for (let i = 0; i < scores.length; i++) {
+    const v = scores[i];
+    if (typeof v !== 'number'
