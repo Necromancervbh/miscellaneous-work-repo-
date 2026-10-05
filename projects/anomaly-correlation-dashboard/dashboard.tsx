@@ -1,211 +1,193 @@
 import React, { useEffect, useRef, useState } from "react";
-import type { FC } from "react";
-
-/**
- * Configuration constants
- */
-const WS_URL = process.env.REACT_APP_WS_URL || "wss://example.com/notifier";
-const JWT_STORAGE_KEY = "auth_token";
-const K_CLUSTERS = 3; // Number of clusters for K‑Means
-const MAX_MESSAGES_PER_SEC = 10; // Rate limit for incoming messages
-
-/**
- * Types
- */
-interface RawMessage {
-  /** Unique identifier of the event */
-  id: string;
-  /** Numeric value(s) used for clustering */
-  values: number[];
-  /** Original timestamp (ms since epoch) */
-  timestamp: number;
-}
-
-interface DataPoint {
-  id: string;
-  values: number[];
-  /** Smoothed timestamp after Kalman filter */
-  timestamp: number;
+import * as d3 from "d3";
+import DBSCAN from "density-clustering"; // npm install density-clustering
+// Ensure TypeScript knows the module
+declare module "density-clustering" {
+  export default class DBSCAN {
+    constructor();
+    run(
+      data: number[][],
+      eps: number,
+      minPts: number
+    ): number[][]; // returns array of clusters (each cluster is array of point indices)
+    noise: number[]; // indices of noise points
+  }
 }
 
 /**
- * Simple Kalman filter for one‑dimensional timestamp smoothing.
- *
- * The filter equations:
- *   predict:   x̂ₖ|ₖ₋₁ = x̂ₖ₋₁
- *   predict:   Pₖ|ₖ₋₁ = Pₖ₋₁ + Q
- *   update:    Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
- *   update:    x̂ₖ = x̂ₖ|ₖ₋₁ + Kₖ (zₖ - x̂ₖ|ₖ₋₁)
- *   update:    Pₖ = (1 - Kₖ) Pₖ|ₖ₋₁
- *
- * Q – process variance, R – measurement variance.
+ * Simple Kalman filter for a single scalar series.
+ * Equations:
+ *   Predict:   x̂ₖ|ₖ₋₁ = x̂ₖ₋₁|ₖ₋₁
+ *   Predict:   Pₖ|ₖ₋₁ = Pₖ₋₁|ₖ₋₁ + Q
+ *   Update:    Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
+ *   Update:    x̂ₖ|ₖ = x̂ₖ|ₖ₋₁ + Kₖ (zₖ - x̂ₖ|ₖ₋₁)
+ *   Update:    Pₖ|ₖ = (1 - Kₖ) Pₖ|ₖ₋₁
  */
-class KalmanFilter {
+class KalmanScalar {
   private estimate: number;
   private errorCovariance: number;
-  private readonly processVariance: number;
-  private readonly measurementVariance: number;
+  private readonly processNoise: number;
+  private readonly measurementNoise: number;
 
-  constructor(initialEstimate: number, processVariance = 1e-3, measurementVariance = 1) {
-    this.estimate = initialEstimate;
+  constructor(initialValue: number, processNoise = 1e-3, measurementNoise = 1e-1) {
+    this.estimate = initialValue;
     this.errorCovariance = 1;
-    this.processVariance = processVariance;
-    this.measurementVariance = measurementVariance;
+    this.processNoise = processNoise;
+    this.measurementNoise = measurementNoise;
   }
 
-  public filter(measurement: number): number {
-    // Predict
-    const priorEstimate = this.estimate;
-    const priorErrorCov = this.errorCovariance + this.processVariance;
+  update(measurement: number): number {
+    // Predict step (no control input)
+    const predEstimate = this.estimate;
+    const predErrorCov = this.errorCovariance + this.processNoise;
 
-    // Update
-    const kalmanGain = priorErrorCov / (priorErrorCov + this.measurementVariance);
-    this.estimate = priorEstimate + kalmanGain * (measurement - priorEstimate);
-    this.errorCovariance = (1 - kalmanGain) * priorErrorCov;
+    // Update step
+    const kalmanGain = predErrorCov / (predErrorCov + this.measurementNoise);
+    this.estimate = predEstimate + kalmanGain * (measurement - predEstimate);
+    this.errorCovariance = (1 - kalmanGain) * predErrorCov;
 
     return this.estimate;
   }
 }
 
 /**
- * Simple K‑Means implementation.
- *
- * @param points Array of numeric vectors.
- * @param k Number of clusters.
- * @param maxIter Maximum iterations.
- * @returns Array of cluster assignments (index per point) and centroids.
+ * Interface for incoming WebSocket messages.
  */
-function kMeans(
-  points: number[][],
-  k: number,
-  maxIter = 100
-): { assignments: number[]; centroids: number[][] } {
-  if (k <= 0) {
-    throw new Error("Number of clusters k must be greater than 0.");
-  }
-  if (points.length < k) {
-    throw new Error("Number of points must be at least equal to k.");
-  }
+interface AnomalyMessage {
+  timestamp: number; // Unix epoch ms
+  vector: number[];
+}
 
-  // Helper: Euclidean distance squared
-  const distSq = (a: number[], b: number[]) => {
-    let sum = 0;
-    for (let i = 0; i < a.length; i++) {
-      const d = a[i] - b[i];
-      sum += d * d;
+/**
+ * Processed point after Kalman filtering.
+ */
+interface ProcessedPoint {
+  timestamp: number;
+  vector: number[];
+  clusterId: number | null; // null for noise/unclustered
+}
+
+/**
+ * Props for Dashboard component.
+ */
+interface DashboardProps {
+  /** WebSocket URL (e.g., wss://api.example.com/anomalies) */
+  wsUrl: string;
+  /** Number of recent points to keep for clustering (window size) */
+  clusteringWindow?: number;
+  /** DBSCAN epsilon parameter (distance threshold) */
+  dbscanEps?: number;
+  /** DBSCAN minimum points per cluster */
+  dbscanMinPts?: number;
+}
+
+/**
+ * React component that visualizes real‑time anomaly vectors.
+ */
+export default function Dashboard({
+  wsUrl,
+  clusteringWindow = 300,
+  dbscanEps = 5,
+  dbscanMinPts = 3,
+}: DashboardProps): JSX.Element {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [points, setPoints] = useState<ProcessedPoint[]>([]);
+  const kalmanFiltersRef = useRef<KalmanScalar[] | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Initialize WebSocket connection
+  useEffect(() => {
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.info("WebSocket connection opened.");
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data: unknown = JSON.parse(event.data);
+          if (
+            typeof data === "object" &&
+            data !== null &&
+            "timestamp" in data &&
+            "vector" in data &&
+            typeof (data as any).timestamp === "number" &&
+            Array.isArray((data as any).vector) &&
+            (data as any).vector.every((v: any) => typeof v === "number")
+          ) {
+            const msg = data as AnomalyMessage;
+            handleIncomingMessage(msg);
+          } else {
+            console.warn("Invalid message format:", event.data);
+          }
+        } catch (e) {
+          console.error("Failed to parse WebSocket message:", e);
+        }
+      };
+
+      ws.onerror = (ev) => {
+        console.error("WebSocket error:", ev);
+      };
+
+      ws.onclose = (ev) => {
+        console.info(`WebSocket closed (code=${ev.code}).`);
+      };
+
+      return () => {
+        ws.close();
+      };
+    } catch (e) {
+      console.error("Failed to create WebSocket:", e);
     }
-    return sum;
+  }, [wsUrl]);
+
+  // Process incoming anomaly message
+  const handleIncomingMessage = (msg: AnomalyMessage) => {
+    // Initialize Kalman filters on first message
+    if (!kalmanFiltersRef.current) {
+      kalmanFiltersRef.current = msg.vector.map(
+        (v) => new KalmanScalar(v)
+      );
+    }
+
+    const filters = kalmanFiltersRef.current!;
+    if (filters.length !== msg.vector.length) {
+      console.error(
+        `Dimension mismatch: expected ${filters.length}, got ${msg.vector.length}`
+      );
+      return;
+    }
+
+    // Apply Kalman filter per dimension
+    const filteredVector = msg.vector.map((value, idx) =>
+      filters[idx].update(value)
+    );
+
+    // Append to points state (maintain window size)
+    setPoints((prev) => {
+      const newPoints = [
+        ...prev,
+        { timestamp: msg.timestamp, vector: filteredVector, clusterId: null },
+      ];
+      if (newPoints.length > clusteringWindow) {
+        newPoints.splice(0, newPoints.length - clusteringWindow);
+      }
+      // Re‑run clustering on the updated window
+      const clustered = runClustering(newPoints);
+      return clustered;
+    });
   };
 
-  // Initialize centroids by random distinct points
-  const centroids: number[][] = [];
-  const usedIdx = new Set<number>();
-  while (centroids.length < k) {
-    const idx = Math.floor(Math.random() * points.length);
-    if (!usedIdx.has(idx)) {
-      usedIdx.add(idx);
-      centroids.push([...points[idx]]);
-    }
-  }
+  // Run DBSCAN clustering on the latest points
+  const runClustering = (data: ProcessedPoint[]): ProcessedPoint[] => {
+    if (data.length === 0) return data;
 
-  let assignments = new Array<number>(points.length).fill(-1);
-  for (let iter = 0; iter < maxIter; iter++) {
-    // Assignment step
-    let changed = false;
-    for (let i = 0; i < points.length; i++) {
-      const point = points[i];
-      let bestIdx = -1;
-      let bestDist = Infinity;
-      for (let c = 0; c < k; c++) {
-        const d = distSq(point, centroids[c]);
-        if (d < bestDist) {
-          bestDist = d;
-          bestIdx = c;
-        }
-      }
-      if (assignments[i] !== bestIdx) {
-        changed = true;
-        assignments[i] = bestIdx;
-      }
-    }
+    const vectors = data.map((p) => p.vector);
+    const dbscan = new DBSCAN();
+    const clusters = dbscan.run(vectors, dbscanEps, dbscanMinPts);
+    const noise = dbscan.noise;
 
-    // Update step
-    const newCentroids = Array.from({ length: k }, () => new Array<number>(points[0].length).fill(0));
-    const counts = new Array<number>(k).fill(0);
-    for (let i = 0; i < points.length; i++) {
-      const cluster = assignments[i];
-      const point = points[i];
-      counts[cluster] += 1;
-      for (let d = 0; d < point.length; d++) {
-        newCentroids[cluster][d] += point[d];
-      }
-    }
-    for (let c = 0; c < k; c++) {
-      if (counts[c] === 0) continue; // avoid division by zero
-      for (let d = 0; d < newCentroids[c].length; d++) {
-        newCentroids[c][d] /= counts[c];
-      }
-    }
-
-    // Check convergence
-    let centroidShift = 0;
-    for (let c = 0; c < k; c++) {
-      centroidShift += Math.sqrt(distSq(centroids[c], newCentroids[c]));
-    }
-    centroids.splice(0, centroids.length, ...newCentroids);
-    if (!changed || centroidShift < 1e-6) {
-      break;
-    }
-  }
-
-  return { assignments, centroids };
-}
-
-/**
- * Rate limiter based on token bucket algorithm.
- */
-class RateLimiter {
-  private tokens: number;
-  private readonly capacity: number;
-  private readonly refillRate: number; // tokens per ms
-  private lastRefill: number;
-
-  constructor(messagesPerSec: number) {
-    this.capacity = messagesPerSec;
-    this.tokens = messagesPerSec;
-    this.refillRate = messagesPerSec / 1000;
-    this.lastRefill = Date.now();
-  }
-
-  public tryRemoveToken(): boolean {
-    const now = Date.now();
-    const elapsed = now - this.lastRefill;
-    this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.refillRate);
-    this.lastRefill = now;
-    if (this.tokens >= 1) {
-      this.tokens -= 1;
-      return true;
-    }
-    return false;
-  }
-}
-
-/**
- * JWT validation utilities.
- */
-function getStoredToken(): string | null {
-  try {
-    return localStorage.getItem(JWT_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Simple JWT expiration check (no signature verification on client side).
- */
-function isTokenValid(token: string): boolean {
-  try {
-    const payload = JSON.parse(atob(token.split(".")[1]));
-    if (!payload.exp) return false;
-    const now = Math.floor(Date
+    // Assign cluster IDs (0‑based). Noise gets null.
+    const clusterMap = new Map<number
