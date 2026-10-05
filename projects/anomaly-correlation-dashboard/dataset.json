@@ -1,5 +1,5 @@
 {
-  "projectName": "Anomaly Correlation Dashboard",
+  "projectName": "Anomaly Correlation Real-Time Dashboard",
   "version": "1.0.0",
   "sampleRecords": [
     { "id": 1, "value": 42.5, "status": "active" },
