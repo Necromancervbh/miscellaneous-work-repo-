@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Alerting Service**](./projects/anomaly-correlation-alerts/) | `Full-Stack` | Node.js / TypeScript / Redis | Real-time alerts for correlated anomalies via WebSocket and email. |
 | [**Anomaly Correlation ML Pipeline**](./projects/anomaly-correlation-ml-pipeline/) | `Data Science` | TypeScript / Node.js | End‑to‑end pipeline linking aggregation, forecasting, and API with model training and evaluation. |
 | [**Anomaly Correlation Analytics Engine**](./projects/anomaly-correlation-analytics-engine/) | `Data Science` | TypeScript / Node.js / Python | Aggregates alerts, runs ML pipelines, and serves insights via API. |
 | [**Anomaly Correlation Alerting Service**](./projects/anomaly-correlation-alerting-service/) | `Data Science` | Node.js / TypeScript / ML | Real‑time alerts from anomaly predictions with throttling and auth. |
