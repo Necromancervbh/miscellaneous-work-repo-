@@ -1,220 +1,202 @@
-import express, { Request, Response, NextFunction } from 'express';
+import http from 'http';
+import url from 'url';
+import { Server as WebSocketServer, WebSocket } from 'ws';
 import jwt from 'jsonwebtoken';
-import rateLimit from 'express-rate-limit';
-import bodyParser from 'body-parser';
-import { DBSCAN } from 'ml-dbscan';
+import LRUCache from 'lru-cache';
+import DBSCAN from 'ml-dbscan';
 import { EventEmitter } from 'events';
-import { randomUUID } from 'crypto';
+import { AddressInfo } from 'net';
 
-// Types
-interface AnomalyVector {
+/**
+ * Types
+ */
+interface AnomalyEvent {
     id: string;
-    timestamp: number;
-    values: number[];
-    source: 'forecast' | 'alert' | 'heatmap';
+    timestamp: number; // epoch ms
+    features: number[]; // numeric feature vector
 }
 
-interface Alert extends AnomalyVector {
-    severity: number; // 0-1
-    description: string;
+interface Cluster {
+    id: string;
+    members: string[]; // array of anomaly ids
+    centroid: number[]; // average of member feature vectors
+    createdAt: number;
 }
 
-interface ClusteredAlert extends Alert {
-    clusterId: number | null;
-    rank: number; // Bayesian posterior probability
+/**
+ * Configuration
+ */
+interface InsightEngineConfig {
+    httpPort?: number;               // Port for HTTP server (WebSocket upgrade)
+    jwtSecret: string;               // Secret for JWT verification
+    dbscanEps?: number;              // DBSCAN epsilon
+    dbscanMinPts?: number;           // DBSCAN minimum points
+    clusterCacheSize?: number;       // Max number of clusters cached
+    rateLimitPerSec?: number;        // Max messages per client per second
+    clusteringIntervalMs?: number;   // How often to recompute clusters
+    eventBufferSize?: number;        // Max events to keep for clustering
 }
 
-// Configuration
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-const DBSCAN_EPS = 0.5; // radius for DBSCAN
-const DBSCAN_MIN_POINTS = 3; // minimum points to form a cluster
-const PRIOR_PROBABILITY = 0.01; // prior probability of an alert being true
+/**
+ * Simple token bucket rate limiter per client
+ */
+class RateLimiter {
+    private maxTokens: number;
+    private refillInterval: number;
+    private tokensMap: Map<string, { tokens: number; lastRefill: number }>;
 
-// Helper Functions
-function validateJWT(req: Request, res: Response, next: NextFunction) {
-    const authHeader = req.headers['authorization'];
-    if (!authHeader) {
-        return res.status(401).json({ error: 'Missing Authorization header' });
+    constructor(maxPerSec: number) {
+        this.maxTokens = maxPerSec;
+        this.refillInterval = 1000; // ms
+        this.tokensMap = new Map();
     }
-    const token = authHeader.split(' ')[1];
-    if (!token) {
-        return res.status(401).json({ error: 'Malformed Authorization header' });
-    }
-    jwt.verify(token, JWT_SECRET, (err, decoded) => {
-        if (err) {
-            return res.status(403).json({ error: 'Invalid token' });
+
+    public tryRemoveToken(clientId: string): boolean {
+        const now = Date.now();
+        const entry = this.tokensMap.get(clientId) ?? { tokens: this.maxTokens, lastRefill: now };
+        const elapsed = now - entry.lastRefill;
+
+        // Refill tokens based on elapsed time
+        const refillTokens = Math.floor((elapsed / this.refillInterval) * this.maxTokens);
+        if (refillTokens > 0) {
+            entry.tokens = Math.min(this.maxTokens, entry.tokens + refillTokens);
+            entry.lastRefill = now;
         }
-        // Attach decoded payload if needed
-        (req as any).user = decoded;
-        next();
-    });
+
+        if (entry.tokens > 0) {
+            entry.tokens -= 1;
+            this.tokensMap.set(clientId, entry);
+            return true;
+        }
+
+        this.tokensMap.set(clientId, entry);
+        return false;
+    }
 }
 
 /**
- * Bayesian inference posterior calculation.
- * posterior = (likelihood * prior) / evidence
- * where evidence = likelihood * prior + (1 - likelihood) * (1 - prior)
+ * InsightEngine class
  */
-function computePosterior(likelihood: number, prior: number = PRIOR_PROBABILITY): number {
-    const evidence = likelihood * prior + (1 - likelihood) * (1 - prior);
-    if (evidence === 0) return 0;
-    return (likelihood * prior) / evidence;
-}
+export class InsightEngine extends EventEmitter {
+    private config: Required<InsightEngineConfig>;
+    private httpServer: http.Server;
+    private wss: WebSocketServer;
+    private clients: Set<WebSocket>;
+    private eventBuffer: AnomalyEvent[];
+    private clusterCache: LRUCache<string, Cluster>;
+    private rateLimiter: RateLimiter;
+    private clusteringTimer: NodeJS.Timeout | null;
 
-/**
- * Simple Euclidean distance between two vectors.
- */
-function euclideanDistance(a: number[], b: number[]): number {
-    if (a.length !== b.length) {
-        throw new Error('Vector dimensions must match');
-    }
-    let sum = 0;
-    for (let i = 0; i < a.length; i++) {
-        const diff = a[i] - b[i];
-        sum += diff * diff;
-    }
-    return Math.sqrt(sum);
-}
+    constructor(config: InsightEngineConfig) {
+        super();
 
-/**
- * Extracts feature vectors from alerts for clustering.
- */
-function extractFeatureMatrix(alerts: Alert[]): number[][] {
-    return alerts.map(alert => alert.values);
-}
+        // Validate required config
+        if (!config.jwtSecret) {
+            throw new Error('jwtSecret is required in config');
+        }
 
-// Main Engine
-export class InsightEngine {
-    private app = express();
-    private server?: ReturnType<typeof this.app.listen>;
-    private alertStore: Map<string, Alert> = new Map();
-    private clusteredAlerts: ClusteredAlert[] = [];
-    private eventBus = new EventEmitter();
+        // Apply defaults
+        this.config = {
+            httpPort: config.httpPort ?? 8080,
+            jwtSecret: config.jwtSecret,
+            dbscanEps: config.dbscanEps ?? 0.5,
+            dbscanMinPts: config.dbscanMinPts ?? 5,
+            clusterCacheSize: config.clusterCacheSize ?? 100,
+            rateLimitPerSec: config.rateLimitPerSec ?? 10,
+            clusteringIntervalMs: config.clusteringIntervalMs ?? 5000,
+            eventBufferSize: config.eventBufferSize ?? 1000,
+        };
 
-    constructor() {
-        this.configureMiddleware();
-        this.configureRoutes();
-        this.registerEventHandlers();
+        this.httpServer = http.createServer(this.handleHttpRequest.bind(this));
+        this.wss = new WebSocketServer({ noServer: true });
+        this.clients = new Set();
+        this.eventBuffer = [];
+        this.clusterCache = new LRUCache<string, Cluster>({ max: this.config.clusterCacheSize });
+        this.rateLimiter = new RateLimiter(this.config.rateLimitPerSec);
+        this.clusteringTimer = null;
+
+        this.setupWebSocketHandling();
     }
 
-    private configureMiddleware() {
-        this.app.use(bodyParser.json());
-
-        // Rate limiting: max 100 requests per 15 minutes per IP
-        const limiter = rateLimit({
-            windowMs: 15 * 60 * 1000,
-            max: 100,
-            standardHeaders: true,
-            legacyHeaders: false,
-            message: { error: 'Too many requests, please try again later.' },
+    /**
+     * Starts the HTTP server and clustering loop.
+     */
+    public start(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            this.httpServer.listen(this.config.httpPort, () => {
+                const address = this.httpServer.address() as AddressInfo;
+                console.log(`InsightEngine HTTP server listening on port ${address.port}`);
+                this.startClusteringLoop();
+                resolve();
+            });
+            this.httpServer.on('error', (err) => reject(err));
         });
-        this.app.use(limiter);
     }
 
-    private configureRoutes() {
-        // Protected endpoint
-        this.app.get('/insights', validateJWT, (req: Request, res: Response) => {
-            try {
-                const sorted = [...this.clusteredAlerts].sort((a, b) => b.rank - a.rank);
-                res.json({ insights: sorted });
-            } catch (err) {
-                res.status(500).json({ error: 'Failed to retrieve insights' });
+    /**
+     * Gracefully stops the service.
+     */
+    public async stop(): Promise<void> {
+        if (this.clusteringTimer) {
+            clearInterval(this.clusteringTimer);
+            this.clusteringTimer = null;
+        }
+        for (const client of this.clients) {
+            client.terminate();
+        }
+        this.wss.close();
+        await new Promise<void>((resolve, reject) => {
+            this.httpServer.close((err) => (err ? reject(err) : resolve()));
+        });
+    }
+
+    /**
+     * Public method to ingest an anomaly event.
+     */
+    public ingestEvent(event: unknown): void {
+        try {
+            const validated = this.validateEvent(event);
+            this.eventBuffer.push(validated);
+            // Trim buffer if exceeds size
+            if (this.eventBuffer.length > this.config.eventBufferSize) {
+                this.eventBuffer.shift();
             }
-        });
-
-        // Health check (unprotected)
-        this.app.get('/health', (_req, res) => {
-            res.json({ status: 'ok' });
-        });
-    }
-
-    private registerEventHandlers() {
-        // When a new alert arrives, store it and trigger processing
-        this.eventBus.on('alert', (alert: Alert) => {
-            this.alertStore.set(alert.id, alert);
-            this.processClusteringAndRanking();
-        });
-
-        // Forecast and heatmap streams could be used to enrich alerts in future extensions.
-        // For now we just log receipt.
-        this.eventBus.on('forecast', (vector: AnomalyVector) => {
-            console.debug('Received forecast vector', vector.id);
-        });
-        this.eventBus.on('heatmap', (vector: AnomalyVector) => {
-            console.debug('Received heatmap vector', vector.id);
-        });
-    }
-
-    /**
-     * Public API to ingest forecast vectors.
-     */
-    public addForecast(vector: Omit<AnomalyVector, 'id' | 'source'>) {
-        const payload: AnomalyVector = {
-            id: randomUUID(),
-            timestamp: vector.timestamp,
-            values: vector.values,
-            source: 'forecast',
-        };
-        this.eventBus.emit('forecast', payload);
-    }
-
-    /**
-     * Public API to ingest heatmap vectors.
-     */
-    public addHeatmap(vector: Omit<AnomalyVector, 'id' | 'source'>) {
-        const payload: AnomalyVector = {
-            id: randomUUID(),
-            timestamp: vector.timestamp,
-            values: vector.values,
-            source: 'heatmap',
-        };
-        this.eventBus.emit('heatmap', payload);
-    }
-
-    /**
-     * Public API to ingest alerts.
-     */
-    public addAlert(alert: Omit<Alert, 'id' | 'source'>) {
-        // Input validation
-        if (!Array.isArray(alert.values) || alert.values.length === 0) {
-            throw new Error('Alert values must be a non‑empty array of numbers');
+        } catch (err) {
+            console.error('Failed to ingest event:', err);
         }
-        if (typeof alert.severity !== 'number' || alert.severity < 0 || alert.severity > 1) {
-            throw new Error('Alert severity must be a number between 0 and 1');
-        }
-        const payload: Alert = {
-            id: randomUUID(),
-            timestamp: alert.timestamp,
-            values: alert.values,
-            source: 'alert',
-            severity: alert.severity,
-            description: alert.description ?? '',
-        };
-        this.eventBus.emit('alert', payload);
     }
 
     /**
-     * Runs DBSCAN clustering on current alerts and computes Bayesian ranks.
+     * Validates the incoming event shape.
      */
-    private processClusteringAndRanking() {
-        const alerts = Array.from(this.alertStore.values());
-        if (alerts.length === 0) {
-            this.clusteredAlerts = [];
-            return;
+    private validateEvent(event: unknown): AnomalyEvent {
+        if (typeof event !== 'object' || event === null) {
+            throw new Error('Event must be an object');
         }
+        const e = event as any;
+        if (typeof e.id !== 'string' || e.id.trim() === '') {
+            throw new Error('Event id must be a non-empty string');
+        }
+        if (typeof e.timestamp !== 'number' || !Number.isFinite(e.timestamp)) {
+            throw new Error('Event timestamp must be a finite number');
+        }
+        if (!Array.isArray(e.features) || e.features.length === 0) {
+            throw new Error('Event features must be a non-empty array');
+        }
+        for (const v of e.features) {
+            if (typeof v !== 'number' || !Number.isFinite(v)) {
+                throw new Error('All feature values must be finite numbers');
+            }
+        }
+        return {
+            id: e.id,
+            timestamp: e.timestamp,
+            features: e.features,
+        };
+    }
 
-        // Prepare feature matrix
-        const features = extractFeatureMatrix(alerts);
-
-        // Run DBSCAN
-        const dbscan = new DBSCAN();
-        const clusters = dbscan.run(features, DBSCAN_EPS, DBSCAN_MIN_POINTS, euclideanDistance);
-
-        // Map each point to its cluster id (or null for noise)
-        const pointClusterMap = new Map<number, number | null>();
-        clusters.forEach((cluster, idx) => {
-            cluster.forEach(pointIdx => pointClusterMap.set(pointIdx, idx));
-        });
-        // Points not in any cluster are noise
-        for (let i =
+    /**
+     * Handles plain HTTP requests (used only for health checks).
+     */
+    private handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+        const parsedUrl = url.parse(req.url
