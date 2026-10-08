@@ -1,117 +1,201 @@
-import { Queue, QueueScheduler, Worker, Job, QueueEvents, JobsOptions } from 'bullmq';
-import IORedis, { RedisOptions } from 'ioredis';
-import { randomUUID } from 'crypto';
+import cron from 'node-cron';
+import Redis from 'ioredis';
+import WebSocket, { Server as WebSocketServer } from 'ws';
+import jwt from 'jsonwebtoken';
+import { kmeans } from 'ml-kmeans';
+import { EventEmitter } from 'events';
+import { createServer, IncomingMessage } from 'http';
+import { URL } from 'url';
 
 /**
- * Enum representing the type of a task in the DAG.
- */
-export enum TaskType {
-  ANALYTICS = 'analytics',
-  PREDICTION = 'prediction',
-  ALERT = 'alert',
-}
-
-/**
- * Interface describing a generic task.
- */
-export interface Task {
-  /** Unique identifier for the task */
-  id: string;
-  /** Type of the task */
-  type: TaskType;
-  /** Arbitrary payload required for execution */
-  payload: any;
-  /** List of task IDs that must complete before this task runs */
-  dependencies?: string[];
-}
-
-/**
- * Helper class for Bayesian aggregation of anomaly scores.
+ * Simple 1‑dimensional Kalman filter implementation.
+ * The filter estimates the true value of a noisy measurement series.
  *
- * Posterior probability P(A|E) = (P(A) * Π_i L_i) /
- *   (P(A) * Π_i L_i + (1 - P(A)) * Π_i (1 - L_i))
- *
- * where:
- *   - P(A) is the prior probability (default 0.5)
- *   - L_i are the likelihoods (individual anomaly scores in [0,1])
+ * Equations:
+ *   Predict:
+ *     x̂ₖ|ₖ₋₁ = x̂ₖ₋₁|ₖ₋₁
+ *     Pₖ|ₖ₋₁ = Pₖ₋₁|ₖ₋₁ + Q
+ *   Update:
+ *     Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
+ *     x̂ₖ|ₖ = x̂ₖ|ₖ₋₁ + Kₖ (zₖ - x̂ₖ|ₖ₋₁)
+ *     Pₖ|ₖ = (1 - Kₖ) Pₖ|ₖ₋₁
  */
-export class BayesianAggregator {
-  /**
-   * Aggregates a list of anomaly scores into a single posterior probability.
-   *
-   * @param scores Array of anomaly scores (each between 0 and 1)
-   * @param prior Prior probability (default 0.5)
-   * @returns Posterior probability in [0,1]
-   */
-  static aggregate(scores: number[], prior: number = 0.5): number {
-    if (!Array.isArray(scores) || scores.length === 0) {
-      throw new Error('Scores array must contain at least one element.');
+class KalmanFilter1D {
+  private q: number; // process variance
+  private r: number; // measurement variance
+  private x: number; // estimated value
+  private p: number; // estimation error covariance
+  private initialized: boolean;
+
+  constructor(q = 1e-5, r = 0.01, initialValue = 0) {
+    this.q = q;
+    this.r = r;
+    this.x = initialValue;
+    this.p = 1;
+    this.initialized = false;
+  }
+
+  public filter(measurements: number[]): { forecast: number[]; residuals: number[] } {
+    const forecast: number[] = [];
+    const residuals: number[] = [];
+
+    for (const z of measurements) {
+      if (!this.initialized) {
+        this.x = z;
+        this.initialized = true;
+      }
+
+      // Predict
+      const pPrior = this.p + this.q;
+
+      // Update
+      const k = pPrior / (pPrior + this.r);
+      const xPost = this.x + k * (z - this.x);
+      const pPost = (1 - k) * pPrior;
+
+      const residual = z - xPost;
+
+      forecast.push(xPost);
+      residuals.push(residual);
+
+      // Prepare for next iteration
+      this.x = xPost;
+      this.p = pPost;
     }
-    if (prior < 0 || prior > 1) {
-      throw new Error('Prior must be between 0 and 1.');
-    }
 
-    const epsilon = 1e-12; // avoid division by zero
-    const prodLikelihood = scores.reduce((acc, s) => acc * Math.min(Math.max(s, epsilon), 1 - epsilon), 1);
-    const prodNegLikelihood = scores.reduce((acc, s) => acc * Math.min(Math.max(1 - s, epsilon), 1 - epsilon), 1);
-
-    const numerator = prior * prodLikelihood;
-    const denominator = numerator + (1 - prior) * prodNegLikelihood;
-
-    return denominator === 0 ? 0 : numerator / denominator;
+    return { forecast, residuals };
   }
 }
 
 /**
- * Orchestrator builds a DAG of tasks, enqueues them using BullMQ,
- * processes them, stores intermediate results, and finally aggregates
- * Bayesian anomaly scores.
+ * Rate limiter based on token bucket algorithm.
+ * Allows `maxTokens` actions per `refillIntervalMs`.
  */
-export class Orchestrator {
-  private readonly connection: IORedis;
-  private readonly queue: Queue;
-  private readonly queueScheduler: QueueScheduler;
-  private readonly worker: Worker;
-  private readonly queueEvents: QueueEvents;
-  private readonly resultHashKey = 'task:results';
-  private readonly pendingJobs: Map<string, Job>;
+class RateLimiter {
+  private maxTokens: number;
+  private refillIntervalMs: number;
+  private tokensMap: Map<string, { tokens: number; lastRefill: number }>;
+
+  constructor(maxTokens = 5, refillIntervalMs = 1000) {
+    this.maxTokens = maxTokens;
+    this.refillIntervalMs = refillIntervalMs;
+    this.tokensMap = new Map();
+  }
+
+  public tryConsume(key: string): boolean {
+    const now = Date.now();
+    const entry = this.tokensMap.get(key) ?? { tokens: this.maxTokens, lastRefill: now };
+    const elapsed = now - entry.lastRefill;
+
+    // Refill tokens proportionally to elapsed time
+    const refillCount = Math.floor(elapsed / this.refillIntervalMs) * this.maxTokens;
+    if (refillCount > 0) {
+      entry.tokens = Math.min(this.maxTokens, entry.tokens + refillCount);
+      entry.lastRefill = now;
+    }
+
+    if (entry.tokens > 0) {
+      entry.tokens -= 1;
+      this.tokensMap.set(key, entry);
+      return true;
+    }
+
+    this.tokensMap.set(key, entry);
+    return false;
+  }
+}
+
+/**
+ * Orchestrator coordinates forecasting, clustering, caching, alerting,
+ * and streaming updates via a JWT‑protected WebSocket.
+ */
+export class Orchestrator extends EventEmitter {
+  private redis: Redis.Redis;
+  private alertEngine: { trigger: (payload: any) => Promise<void> };
+  private wss: WebSocketServer | null = null;
+  private jwtSecret: string;
+  private rateLimiter: RateLimiter;
+
+  constructor(
+    redisUrl: string,
+    alertEngine: { trigger: (payload: any) => Promise<void> },
+    jwtSecret: string,
+    rateLimiterOptions?: { maxTokens?: number; refillIntervalMs?: number }
+  ) {
+    super();
+
+    if (!redisUrl) {
+      throw new Error('Redis URL must be provided');
+    }
+    if (!jwtSecret) {
+      throw new Error('JWT secret must be provided');
+    }
+
+    this.redis = new Redis(redisUrl);
+    this.alertEngine = alertEngine;
+    this.jwtSecret = jwtSecret;
+    this.rateLimiter = new RateLimiter(
+      rateLimiterOptions?.maxTokens ?? 5,
+      rateLimiterOptions?.refillIntervalMs ?? 1000
+    );
+  }
 
   /**
-   * Constructs an Orchestrator.
-   *
-   * @param redisOptions Options for connecting to Redis.
-   * @param queueName   Name of the BullMQ queue (default: 'anomaly-orchestrator')
+   * Schedule a recurring Kalman forecast job.
+   * @param cronExpression Valid cron string (e.g., '0 * * * *')
+   * @param dataProvider Function returning a Promise of numeric array
+   * @param k Number of clusters for K‑Means
    */
-  constructor(redisOptions: RedisOptions, queueName: string = 'anomaly-orchestrator') {
-    this.connection = new IORedis(redisOptions);
-    this.queue = new Queue(queueName, { connection: this.connection });
-    this.queueScheduler = new QueueScheduler(queueName, { connection: this.connection });
-    this.queueEvents = new QueueEvents(queueName, { connection: this.connection });
-    this.pendingJobs = new Map();
+  public scheduleForecast(
+    cronExpression: string,
+    dataProvider: () => Promise<number[]>,
+    k: number = 3
+  ): void {
+    if (!cron.validate(cronExpression)) {
+      throw new Error(`Invalid cron expression: ${cronExpression}`);
+    }
+    if (typeof dataProvider !== 'function') {
+      throw new Error('dataProvider must be a function returning a Promise<number[]>');
+    }
+    if (!Number.isInteger(k) || k <= 0) {
+      throw new Error('k must be a positive integer');
+    }
 
-    // Worker processes each job based on its type.
-    this.worker = new Worker(
-      queueName,
-      async (job: Job) => this.processJob(job),
-      {
-        connection: this.connection,
-        concurrency: 5,
-      },
-    );
+    cron.schedule(cronExpression, async () => {
+      try {
+        const rawData = await dataProvider();
+        if (!Array.isArray(rawData) || rawData.some((v) => typeof v !== 'number')) {
+          throw new Error('Data provider must return an array of numbers');
+        }
 
-    this.worker.on('failed', (job, err) => {
-      console.error(`Job ${job?.id} failed:`, err);
+        const { forecast, residuals } = new KalmanFilter1D().filter(rawData);
+        const clusters = this.runKMeans(residuals, k);
+        const cacheKey = `forecast:${Date.now()}`;
+        await this.cacheResult(cacheKey, { forecast, residuals, clusters });
+
+        await this.triggerAlertIfNeeded(clusters);
+        this.broadcastUpdate({ type: 'forecast', data: { forecast, residuals, clusters } });
+      } catch (err) {
+        this.emit('error', err);
+      }
     });
   }
 
   /**
-   * Adds a collection of tasks to the queue, respecting dependencies.
-   *
-   * @param tasks Array of Task objects.
+   * Run K‑Means clustering on residuals.
+   * @param residuals Numeric array
+   * @param k Number of clusters
    */
-  async addTasks(tasks: Task[]): Promise<void> {
-    this.validateTasks(tasks);
-    const sorted = this.topologicalSort(tasks);
-    const idToJobId = new Map<string, string>();
+  private runKMeans(residuals: number[], k: number) {
+    // ml‑kmeans expects a 2‑D array of points
+    const points = residuals.map((v) => [v]);
+    const result = kmeans(points, k);
+    // Transform result to a more convenient shape
+    return {
+      centroids: result.centroids.map((c) => c.centroid[0]),
+      assignments: result.clusters,
+    };
+  }
 
-    for (const task of sorted) {
+  /**
+   * Cache result in Redis using LRU eviction (Redis must be configured with maxmemory-policy allkeys-lru).
