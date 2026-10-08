@@ -1,88 +1,62 @@
 import { describe, it, expect } from 'vitest';
-import {
-  calculateCorrelation,
-  normalizeData,
-  detectAnomalies,
-} from './insightEngine';
+import { computeAnomalyCorrelation } from '../insightEngine';
 
-describe('Anomaly Correlation Insight Engine', () => {
-  // Normal input tests
-  describe('calculateCorrelation - normal cases', () => {
-    it('should return a positive correlation for increasing series', () => {
-      const data = [1, 2, 3, 4, 5];
-      const result = calculateCorrelation(data);
-      expect(result).toBeGreaterThan(0);
-      expect(result).toBeLessThanOrEqual(1);
-    });
-
-    it('should return a negative correlation for decreasing series', () => {
-      const data = [5, 4, 3, 2, 1];
-      const result = calculateCorrelation(data);
-      expect(result).toBeLessThan(0);
-      expect(result).toBeGreaterThanOrEqual(-1);
-    });
-
-    it('should return zero correlation for random uncorrelated data', () => {
-      const data = [10, -3, 7, 2, -5];
-      const result = calculateCorrelation(data);
-      expect(Math.abs(result)).toBeLessThanOrEqual(0.5);
-    });
+describe('computeAnomalyCorrelation', () => {
+  // Normal input
+  it('should return a correlation coefficient between -1 and 1 for typical data sets', () => {
+    const data = [
+      { value: 10, anomalyScore: 0.2 },
+      { value: 20, anomalyScore: 0.4 },
+      { value: 30, anomalyScore: 0.6 },
+      { value: 40, anomalyScore: 0.8 },
+      { value: 50, anomalyScore: 1.0 },
+    ];
+    const result = computeAnomalyCorrelation(data);
+    expect(typeof result).toBe('number');
+    expect(result).toBeGreaterThanOrEqual(-1);
+    expect(result).toBeLessThanOrEqual(1);
   });
 
-  // Edge case tests
-  describe('calculateCorrelation - edge cases', () => {
-    it('should return 0 for an empty array', () => {
-      const result = calculateCorrelation([]);
-      expect(result).toBe(0);
-    });
-
-    it('should handle an array of zeros', () => {
-      const result = calculateCorrelation([0, 0, 0, 0]);
-      expect(result).toBe(0);
-    });
-
-    it('should throw when input contains null', () => {
-      // @ts-ignore – intentionally passing invalid data
-      expect(() => calculateCorrelation([1, null, 3])).toThrow();
-    });
-
-    it('should correctly process negative numbers', () => {
-      const data = [-10, -5, 0, 5, 10];
-      const result = calculateCorrelation(data);
-      expect(result).toBeCloseTo(1, 5);
-    });
-
-    it('should return 0 for a single-element array', () => {
-      const result = calculateCorrelation([42]);
-      expect(result).toBe(0);
-    });
+  // Edge case: empty array
+  it('should return null when given an empty array', () => {
+    const result = computeAnomalyCorrelation([]);
+    expect(result).toBeNull();
   });
 
-  // Boundary condition tests
-  describe('calculateCorrelation - boundary conditions', () => {
-    it('should handle very large numbers without overflow', () => {
-      const data = [1e308, 2e308, 3e308];
-      const result = calculateCorrelation(data);
-      expect(result).toBeGreaterThanOrEqual(-1);
-      expect(result).toBeLessThanOrEqual(1);
-    });
-
-    it('should handle very small (subnormal) numbers', () => {
-      const data = [Number.MIN_VALUE, Number.MIN_VALUE * 2, Number.MIN_VALUE * 3];
-      const result = calculateCorrelation(data);
-      expect(result).toBeCloseTo(1, 5);
-    });
-
-    it('should be symmetric: reverse input yields same magnitude', () => {
-      const data = [1, 3, 5, 7, 9];
-      const forward = calculateCorrelation(data);
-      const reverse = calculateCorrelation([...data].reverse());
-      expect(Math.abs(forward)).toBeCloseTo(Math.abs(reverse), 5);
-    });
+  // Edge case: array with a single element (insufficient data)
+  it('should return null when given a single data point', () => {
+    const data = [{ value: 42, anomalyScore: 0.5 }];
+    const result = computeAnomalyCorrelation(data);
+    expect(result).toBeNull();
   });
 
-  // Additional helper function tests
-  describe('normalizeData', () => {
-    it('should scale data to [0,1] range', () => {
-      const data = [10, 20, 30];
-      const
+  // Edge case: zero values
+  it('should correctly handle data points with zero values', () => {
+    const data = [
+      { value: 0, anomalyScore: 0 },
+      { value: 0, anomalyScore: 0 },
+      { value: 0, anomalyScore: 0 },
+    ];
+    const result = computeAnomalyCorrelation(data);
+    // Correlation is undefined for constant series; engine should return null
+    expect(result).toBeNull();
+  });
+
+  // Edge case: null values in the dataset
+  it('should throw a TypeError when data contains null entries', () => {
+    const data = [
+      { value: 10, anomalyScore: 0.2 },
+      null,
+      { value: 30, anomalyScore: 0.6 },
+    ];
+    expect(() => computeAnomalyCorrelation(data as any)).toThrow(TypeError);
+  });
+
+  // Edge case: negative numbers
+  it('should correctly compute correlation when values include negatives', () => {
+    const data = [
+      { value: -10, anomalyScore: 0.9 },
+      { value: -5, anomalyScore: 0.6 },
+      { value: 0, anomalyScore: 0.3 },
+      { value: 5, anomalyScore: 0.0 },
+      { value: 10, anomalyScore: -0.
