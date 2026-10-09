@@ -1,5 +1,5 @@
 /**
- * Type Definitions for Anomaly Correlation Real-Time Dashboard
+ * Type Definitions for Anomaly Correlation Dashboard
  */
 export interface ConfigOptions {
   debug?: boolean;
