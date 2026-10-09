@@ -1,181 +1,215 @@
 import http from 'http';
-import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
-import bodyParser from 'body-parser';
-import jwt, { JwtPayload } from 'jsonwebtoken';
-import { Server as WebSocketServer, WebSocket } from 'ws';
-import rateLimit from 'express-rate-limit';
+import url from 'url';
+import { WebSocketServer, WebSocket } from 'ws';
 import LRUCache from 'lru-cache';
+import PCA from 'ml-pca';
+import { kmeans } from 'ml-kmeans';
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
 
-// ---------- Configuration ----------
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
-const WS_PATH = '/ws/anomalies';
-const MAX_CACHE_ITEMS = 500;
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const WS_MESSAGE_RATE_LIMIT = 5; // messages per second per client
-
-// ---------- LRU Cache ----------
-type AnomalyScore = {
-  timestamp: number; // epoch ms
-  score: number;
-  details?: any;
-};
-
-const anomalyCache = new LRUCache<string, AnomalyScore>({
-  max: MAX_CACHE_ITEMS,
-  ttl: CACHE_TTL_MS,
-});
-
-// ---------- Express App ----------
-const app = express();
-
-app.use(cors());
-app.use(bodyParser.json());
-
-// ---------- Rate Limiter for HTTP ----------
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 100, // limit each IP to 100 requests per windowMs
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (_req, res) => {
-    res.status(429).json({ error: 'Too many requests, please try again later.' });
-  },
-});
-
-app.use('/api/', apiLimiter);
-
-// ---------- JWT Authentication Middleware ----------
-interface AuthenticatedRequest extends Request {
-  user?: string | JwtPayload;
+/**
+ * Types
+ */
+interface Anomaly {
+  id: string;
+  timestamp: number;
+  features: number[]; // Original high‑dimensional feature vector
 }
 
-function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Authorization header missing or malformed.' });
-  }
-
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token.' });
-  }
-}
-
-// ---------- Health Check ----------
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: Date.now() });
-});
-
-// ---------- Receive Anomaly Scores ----------
-app.post('/api/anomaly', authenticateJWT, (req: AuthenticatedRequest, res: Response) => {
-  const { timestamp, score, details } = req.body as Partial<AnomalyScore>;
-
-  // Input validation
-  if (typeof timestamp !== 'number' || typeof score !== 'number') {
-    return res.status(400).json({ error: 'Invalid payload: timestamp and score are required numbers.' });
-  }
-
-  const anomaly: AnomalyScore = {
-    timestamp,
-    score,
-    details: details ?? null,
-  };
-
-  // Store in LRU cache
-  const cacheKey = timestamp.toString();
-  anomalyCache.set(cacheKey, anomaly);
-
-  // Emit to WebSocket listeners
-  orchestratorEmitter.emit('anomaly', anomaly);
-
-  res.status(201).json({ message: 'Anomaly score received.', id: cacheKey });
-});
-
-// ---------- Retrieve Recent Anomalies ----------
-app.get('/api/anomalies/recent', authenticateJWT, (req: AuthenticatedRequest, res: Response) => {
-  const recent = anomalyCache.values();
-  res.json({ count: recent.length, anomalies: Array.from(recent) });
-});
-
-// ---------- Orchestrator Event Emitter ----------
-const orchestratorEmitter = new EventEmitter();
-
-// ---------- HTTP Server ----------
-const server = http.createServer(app);
-
-// ---------- WebSocket Server ----------
-const wss = new WebSocketServer({ server, path: WS_PATH });
-
-interface ClientInfo {
-  socket: WebSocket;
-  lastMessageTimestamps: number[]; // epoch ms of recent messages
+interface ClusteredGroup {
+  centroid: number[];
+  members: Anomaly[];
 }
 
 /**
- * Checks if a client exceeds the allowed message rate.
- * Uses a sliding window of 1 second.
- * @param timestamps Array of previous message timestamps.
- * @returns true if within limit, false otherwise.
+ * Configuration constants
  */
-function isWithinRateLimit(timestamps: number[]): boolean {
-  const now = Date.now();
-  const windowStart = now - 1000; // 1 second window
-  const recent = timestamps.filter((t) => t >= windowStart);
-  return recent.length < WS_MESSAGE_RATE_LIMIT;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
+const PCA_COMPONENTS = 2; // Reduce to 2‑D for visualization
+const KMEANS_CLUSTERS = 5; // Number of clusters
+const CACHE_MAX_ITEMS = 100; // Max cached result sets
+const CACHE_MAX_AGE_MS = 60_000; // 1 minute cache TTL
+const RATE_LIMIT_MAX_MESSAGES = 10; // Max messages per user per interval
+const RATE_LIMIT_INTERVAL_MS = 1_000; // Interval for rate limiting (1 second)
+
+/**
+ * LRU cache for recent processed results.
+ * Key: stringified parameters (e.g., "pca2_k5")
+ * Value: ClusteredGroup[]
+ */
+const resultCache = new LRUCache<string, ClusteredGroup[]>({
+  max: CACHE_MAX_ITEMS,
+  ttl: CACHE_MAX_AGE_MS,
+});
+
+/**
+ * Simple token‑bucket rate limiter per user.
+ */
+class RateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+
+  constructor(private readonly capacity: number, private readonly refillIntervalMs: number) {
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
+
+  /**
+   * Attempt to consume a token.
+   * @returns true if allowed, false otherwise.
+   */
+  public tryConsume(): boolean {
+    this.refillTokens();
+    if (this.tokens > 0) {
+      this.tokens--;
+      return true;
+    }
+    return false;
+  }
+
+  private refillTokens(): void {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    if (elapsed >= this.refillIntervalMs) {
+      const refillCount = Math.floor(elapsed / this.refillIntervalMs) * this.capacity;
+      this.tokens = Math.min(this.tokens + refillCount, this.capacity);
+      this.lastRefill = now - (elapsed % this.refillIntervalMs);
+    }
+  }
 }
 
-// Map to store client info for rate limiting
-const clients = new Map<string, ClientInfo>();
+/**
+ * Map of userId -> RateLimiter
+ */
+const userRateLimiters = new Map<string, RateLimiter>();
 
-wss.on('connection', (ws: WebSocket, request) => {
-  // Extract token from query string: ws://host/ws/anomalies?token=...
-  const url = new URL(request.url ?? '', `http://${request.headers.host}`);
-  const token = url.searchParams.get('token');
+/**
+ * Event emitter to broadcast processed results to all connected clients.
+ */
+const resultEmitter = new EventEmitter();
 
-  if (!token) {
-    ws.close(4001, 'Missing token');
-    return;
+/**
+ * Mock function to retrieve recent anomalies.
+ * In a real implementation this would query a database or message queue.
+ */
+async function fetchRecentAnomalies(limit: number = 500): Promise<Anomaly[]> {
+  // Simulate async I/O latency
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const anomalies: Anomaly[] = [];
+  for (let i = 0; i < limit; i++) {
+    anomalies.push({
+      id: randomUUID(),
+      timestamp: Date.now() - Math.floor(Math.random() * 60_000),
+      features: Array.from({ length: 10 }, () => Math.random() * 100),
+    });
+  }
+  return anomalies;
+}
+
+/**
+ * Apply PCA to reduce dimensionality.
+ * @param data Matrix of shape (n_samples, n_features)
+ * @returns Reduced matrix of shape (n_samples, PCA_COMPONENTS)
+ */
+function applyPCA(data: number[][]): number[][] {
+  // PCA_COMPONENTS is small; we keep all components for variance calculation.
+  const pca = new PCA(data, { center: true, scale: true });
+  // Transform data to the desired number of components.
+  return pca.predict(data, { nComponents: PCA_COMPONENTS }).to2DArray();
+}
+
+/**
+ * Cluster data using k‑means.
+ * @param reducedData Matrix after PCA (n_samples, PCA_COMPONENTS)
+ * @param anomalies Original anomalies (must be same order as reducedData)
+ * @returns Clustered groups.
+ */
+function clusterData(reducedData: number[][], anomalies: Anomaly[]): ClusteredGroup[] {
+  const { clusters, centroids } = kmeans(reducedData, KMEANS_CLUSTERS);
+  const groups: ClusteredGroup[] = centroids.map((centroid, idx) => ({
+    centroid,
+    members: [],
+  }));
+
+  clusters.forEach((clusterIdx: number, pointIdx: number) => {
+    groups[clusterIdx].members.push(anomalies[pointIdx]);
+  });
+
+  return groups;
+}
+
+/**
+ * Process anomalies: fetch, reduce, cluster, and cache.
+ * @returns ClusteredGroup[]
+ */
+async function processAnomalies(): Promise<ClusteredGroup[]> {
+  const cacheKey = `pca${PCA_COMPONENTS}_k${KMEANS_CLUSTERS}`;
+  const cached = resultCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
 
-  // Verify JWT
-  try {
-    jwt.verify(token, JWT_SECRET);
-  } catch (err) {
-    ws.close(4002, 'Invalid token');
-    return;
+  const anomalies = await fetchRecentAnomalies();
+  if (anomalies.length === 0) {
+    return [];
   }
 
-  const clientId = `${request.socket.remoteAddress}:${request.socket.remotePort}`;
-  clients.set(clientId, { socket: ws, lastMessageTimestamps: [] });
+  const featureMatrix = anomalies.map((a) => a.features);
+  // Input validation: ensure matrix is non‑empty and rectangular
+  if (featureMatrix.length === 0 || featureMatrix[0].length === 0) {
+    throw new Error('Invalid feature matrix for PCA.');
+  }
 
-  // Send recent cached anomalies on connect
-  const recent = anomalyCache.values();
-  ws.send(JSON.stringify({ type: 'init', anomalies: Array.from(recent) }));
+  const reduced = applyPCA(featureMatrix);
+  const groups = clusterData(reduced, anomalies);
+  resultCache.set(cacheKey, groups);
+  return groups;
+}
 
-  // Listener for new anomalies
-  const anomalyListener = (anomaly: AnomalyScore) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'anomaly', data: anomaly }));
+/**
+ * Periodically compute results and emit to listeners.
+ */
+function startResultComputationLoop(intervalMs: number = 5_000): void {
+  setInterval(async () => {
+    try {
+      const groups = await processAnomalies();
+      resultEmitter.emit('update', groups);
+    } catch (err) {
+      console.error('Error processing anomalies:', err);
     }
-  };
-  orchestratorEmitter.on('anomaly', anomalyListener);
+  }, intervalMs);
+}
 
-  // Handle incoming messages (e.g., ping)
-  ws.on('message', (data) => {
-    const clientInfo = clients.get(clientId);
-    if (!clientInfo) return;
+/**
+ * Validate and extract userId from the WebSocket connection URL.
+ * Expected format: ws://host:port?userId=someId
+ */
+function extractUserId(requestUrl: string): string | null {
+  try {
+    const parsed = url.parse(requestUrl, true);
+    const userId = parsed.query.userId;
+    if (typeof userId === 'string' && userId.trim().length > 0) {
+      return userId.trim();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
-    const now = Date.now();
-    clientInfo.lastMessageTimestamps = clientInfo.lastMessageTimestamps.filter(
-      (t) => now - t < 1000
-    );
-    clientInfo.lastMessageTimestamps.push(now);
+/**
+ * Initialize the HTTP server and attach a WebSocket server.
+ */
+export function startDashboardServer(): void {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Anomaly Correlation Dashboard WebSocket server is running.\n');
+  });
 
-    if (!isWithinRateLimit(clientInfo.lastMessageT
+  const wss = new WebSocketServer({ noServer: true });
+
+  wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
+    const userId = extractUserId(request.url ?? '');
+    if (!userId) {
+      ws
