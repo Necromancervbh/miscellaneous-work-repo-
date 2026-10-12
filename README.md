@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation MLOps Orchestrator**](./projects/anomaly-correlation-mlops/) | `Data Science` | TypeScript / Node.js | Automates model training, evaluation, and deployment pipelines for anomaly correlation. |
 | [**Forecasting Engine**](./projects/anomaly-correlation-forecasting/) | `Data Science` | Node.js / TypeScript | Predict future anomalies using Kalman filter and STL. |
 | [**Anomaly Correlation Alerting Service**](./projects/anomaly-correlation-alerts/) | `Full-Stack` | Node.js / TypeScript / Redis | Real-time alerts for correlated anomalies via WebSocket and email. |
 | [**Anomaly Correlation ML Pipeline**](./projects/anomaly-correlation-ml-pipeline/) | `Data Science` | TypeScript / Node.js | End‑to‑end pipeline linking aggregation, forecasting, and API with model training and evaluation. |
