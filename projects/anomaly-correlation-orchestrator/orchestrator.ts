@@ -1,201 +1,226 @@
-import cron from 'node-cron';
-import Redis from 'ioredis';
-import WebSocket, { Server as WebSocketServer } from 'ws';
-import jwt from 'jsonwebtoken';
-import { kmeans } from 'ml-kmeans';
-import { EventEmitter } from 'events';
-import { createServer, IncomingMessage } from 'http';
-import { URL } from 'url';
+import express, { Request, Response, NextFunction } from 'express';
+import { createServer } from 'http';
+import { Server as WebSocketServer, WebSocket } from 'ws';
+import rateLimit from 'express-rate-limit';
+import jwt, { JwtPayload } from 'jsonwebtoken';
+import { Queue, Worker, QueueScheduler, Job } from 'bullmq';
+import IORedis from 'ioredis';
+import LRUCache from 'lru-cache';
+import { body, validationResult } from 'express-validator';
+import { v4 as uuidv4 } from 'uuid';
+import dotenv from 'dotenv';
 
-/**
- * Simple 1‑dimensional Kalman filter implementation.
- * The filter estimates the true value of a noisy measurement series.
- *
- * Equations:
- *   Predict:
- *     x̂ₖ|ₖ₋₁ = x̂ₖ₋₁|ₖ₋₁
- *     Pₖ|ₖ₋₁ = Pₖ₋₁|ₖ₋₁ + Q
- *   Update:
- *     Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
- *     x̂ₖ|ₖ = x̂ₖ|ₖ₋₁ + Kₖ (zₖ - x̂ₖ|ₖ₋₁)
- *     Pₖ|ₖ = (1 - Kₖ) Pₖ|ₖ₋₁
- */
-class KalmanFilter1D {
-  private q: number; // process variance
-  private r: number; // measurement variance
-  private x: number; // estimated value
-  private p: number; // estimation error covariance
-  private initialized: boolean;
+// Load environment variables
+dotenv.config();
 
-  constructor(q = 1e-5, r = 0.01, initialValue = 0) {
-    this.q = q;
-    this.r = r;
-    this.x = initialValue;
-    this.p = 1;
-    this.initialized = false;
+const {
+  PORT = '3000',
+  JWT_SECRET = 'change_this_secret',
+  REDIS_URL = 'redis://localhost:6379',
+  RATE_LIMIT_WINDOW_MS = '60000',
+  RATE_LIMIT_MAX = '100',
+  LRU_MAX_ITEMS = '1000',
+  LRU_MAX_AGE_MS = '3600000', // 1 hour
+} = process.env;
+
+// Initialize Redis connection
+const redisConnection = new IORedis(REDIS_URL);
+
+// Initialize BullMQ components
+const queueName = 'anomaly-orchestrator-queue';
+const queue = new Queue(queueName, { connection: redisConnection });
+const queueScheduler = new QueueScheduler(queueName, { connection: redisConnection });
+
+// LRU Cache for results
+const resultCache = new LRUCache<string, any>({
+  max: Number(LRU_MAX_ITEMS),
+  ttl: Number(LRU_MAX_AGE_MS),
+});
+
+// WebSocket subscription management
+type SubscriptionMap = Map<string, Set<WebSocket>>; // jobId -> Set of sockets
+const subscriptions: SubscriptionMap = new Map();
+
+// Import service modules (assumed to be present in the project)
+import { graphAnalysis } from './graphAnalysis';
+import { forecastService } from './forecastService';
+import { explainabilityService } from './explainabilityService';
+
+// Express app setup
+const app = express();
+app.use(express.json());
+
+// Rate limiter middleware
+const apiLimiter = rateLimit({
+  windowMs: Number(RATE_LIMIT_WINDOW_MS),
+  max: Number(RATE_LIMIT_MAX),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(apiLimiter);
+
+// JWT authentication middleware
+interface AuthenticatedRequest extends Request {
+  user?: string | JwtPayload;
+}
+function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or malformed Authorization header' });
   }
-
-  public filter(measurements: number[]): { forecast: number[]; residuals: number[] } {
-    const forecast: number[] = [];
-    const residuals: number[] = [];
-
-    for (const z of measurements) {
-      if (!this.initialized) {
-        this.x = z;
-        this.initialized = true;
-      }
-
-      // Predict
-      const pPrior = this.p + this.q;
-
-      // Update
-      const k = pPrior / (pPrior + this.r);
-      const xPost = this.x + k * (z - this.x);
-      const pPost = (1 - k) * pPrior;
-
-      const residual = z - xPost;
-
-      forecast.push(xPost);
-      residuals.push(residual);
-
-      // Prepare for next iteration
-      this.x = xPost;
-      this.p = pPost;
-    }
-
-    return { forecast, residuals };
+  const token = authHeader.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-/**
- * Rate limiter based on token bucket algorithm.
- * Allows `maxTokens` actions per `refillIntervalMs`.
- */
-class RateLimiter {
-  private maxTokens: number;
-  private refillIntervalMs: number;
-  private tokensMap: Map<string, { tokens: number; lastRefill: number }>;
-
-  constructor(maxTokens = 5, refillIntervalMs = 1000) {
-    this.maxTokens = maxTokens;
-    this.refillIntervalMs = refillIntervalMs;
-    this.tokensMap = new Map();
-  }
-
-  public tryConsume(key: string): boolean {
-    const now = Date.now();
-    const entry = this.tokensMap.get(key) ?? { tokens: this.maxTokens, lastRefill: now };
-    const elapsed = now - entry.lastRefill;
-
-    // Refill tokens proportionally to elapsed time
-    const refillCount = Math.floor(elapsed / this.refillIntervalMs) * this.maxTokens;
-    if (refillCount > 0) {
-      entry.tokens = Math.min(this.maxTokens, entry.tokens + refillCount);
-      entry.lastRefill = now;
-    }
-
-    if (entry.tokens > 0) {
-      entry.tokens -= 1;
-      this.tokensMap.set(key, entry);
+// Input validation chain for job submission
+const jobValidation = [
+  body('payload')
+    .isObject()
+    .withMessage('payload must be an object')
+    .custom((value) => {
+      // Example: ensure required fields exist
+      if (!value?.data) {
+        throw new Error('payload must contain a data field');
+      }
       return true;
+    }),
+];
+
+// Route: Submit a new analysis job
+app.post(
+  '/jobs',
+  authenticateJWT,
+  jobValidation,
+  async (req: AuthenticatedRequest, res: Response) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    this.tokensMap.set(key, entry);
-    return false;
+    const jobId = uuidv4();
+    const payload = req.body.payload;
+
+    try {
+      await queue.add(
+        jobId,
+        { payload, jobId },
+        {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+          removeOnComplete: true,
+          removeOnFail: true,
+        },
+      );
+
+      // Initial broadcast: job queued
+      broadcastStatus(jobId, { status: 'queued' });
+
+      return res.status(202).json({ jobId });
+    } catch (err) {
+      console.error('Failed to enqueue job:', err);
+      return res.status(500).json({ error: 'Failed to enqueue job' });
+    }
+  },
+);
+
+// Route: Retrieve job result (from cache)
+app.get('/jobs/:jobId/result', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId) {
+    return res.status(400).json({ error: 'Missing jobId parameter' });
+  }
+
+  const cached = resultCache.get(jobId);
+  if (!cached) {
+    return res.status(404).json({ error: 'Result not found or not yet computed' });
+  }
+
+  return res.json({ jobId, result: cached });
+});
+
+// Helper: Broadcast status updates to subscribed WebSocket clients
+function broadcastStatus(jobId: string, message: any) {
+  const clients = subscriptions.get(jobId);
+  if (!clients) return;
+  const payload = JSON.stringify({ jobId, ...message });
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(payload);
+    }
   }
 }
 
-/**
- * Orchestrator coordinates forecasting, clustering, caching, alerting,
- * and streaming updates via a JWT‑protected WebSocket.
- */
-export class Orchestrator extends EventEmitter {
-  private redis: Redis.Redis;
-  private alertEngine: { trigger: (payload: any) => Promise<void> };
-  private wss: WebSocketServer | null = null;
-  private jwtSecret: string;
-  private rateLimiter: RateLimiter;
+// BullMQ worker to process jobs
+const worker = new Worker(
+  queueName,
+  async (job: Job) => {
+    const { payload, jobId } = job.data as { payload: any; jobId: string };
+    try {
+      broadcastStatus(jobId, { status: 'processing' });
 
-  constructor(
-    redisUrl: string,
-    alertEngine: { trigger: (payload: any) => Promise<void> },
-    jwtSecret: string,
-    rateLimiterOptions?: { maxTokens?: number; refillIntervalMs?: number }
-  ) {
-    super();
+      // 1. Graph analysis
+      // Formula: G = f(data) where f is the graph analysis algorithm
+      const graphResult = await graphAnalysis(payload);
 
-    if (!redisUrl) {
-      throw new Error('Redis URL must be provided');
+      // 2. Forecast service
+      // Formula: F = g(G) where g forecasts based on graph result
+      const forecastResult = await forecastService(graphResult);
+
+      // 3. Explainability service
+      // Formula: E = h(F) where h provides explanations for forecast
+      const explainabilityResult = await explainabilityService(forecastResult);
+
+      const combinedResult = {
+        graphResult,
+        forecastResult,
+        explainabilityResult,
+      };
+
+      // Store in LRU cache
+      resultCache.set(jobId, combinedResult);
+
+      // Broadcast completion
+      broadcastStatus(jobId, { status: 'completed', result: combinedResult });
+
+      return combinedResult;
+    } catch (err) {
+      console.error(`Job ${jobId} failed:`, err);
+      broadcastStatus(jobId, { status: 'failed', error: (err as Error).message });
+      throw err;
     }
-    if (!jwtSecret) {
-      throw new Error('JWT secret must be provided');
-    }
+  },
+  { connection: redisConnection },
+);
 
-    this.redis = new Redis(redisUrl);
-    this.alertEngine = alertEngine;
-    this.jwtSecret = jwtSecret;
-    this.rateLimiter = new RateLimiter(
-      rateLimiterOptions?.maxTokens ?? 5,
-      rateLimiterOptions?.refillIntervalMs ?? 1000
-    );
+worker.on('failed', (job, err) => {
+  if (job) {
+    broadcastStatus(job.id as string, { status: 'failed', error: err.message });
   }
+});
 
-  /**
-   * Schedule a recurring Kalman forecast job.
-   * @param cronExpression Valid cron string (e.g., '0 * * * *')
-   * @param dataProvider Function returning a Promise of numeric array
-   * @param k Number of clusters for K‑Means
-   */
-  public scheduleForecast(
-    cronExpression: string,
-    dataProvider: () => Promise<number[]>,
-    k: number = 3
-  ): void {
-    if (!cron.validate(cronExpression)) {
-      throw new Error(`Invalid cron expression: ${cronExpression}`);
-    }
-    if (typeof dataProvider !== 'function') {
-      throw new Error('dataProvider must be a function returning a Promise<number[]>');
-    }
-    if (!Number.isInteger(k) || k <= 0) {
-      throw new Error('k must be a positive integer');
-    }
+// HTTP server and WebSocket server setup
+const httpServer = createServer(app);
+const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-    cron.schedule(cronExpression, async () => {
-      try {
-        const rawData = await dataProvider();
-        if (!Array.isArray(rawData) || rawData.some((v) => typeof v !== 'number')) {
-          throw new Error('Data provider must return an array of numbers');
+wss.on('connection', (ws: WebSocket) => {
+  // Expect a subscription message: { type: 'subscribe', jobId: '...' }
+  ws.on('message', (data: WebSocket.Data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'subscribe' && typeof msg.jobId === 'string') {
+        const { jobId } = msg;
+        if (!subscriptions.has(jobId)) {
+          subscriptions.set(jobId, new Set());
         }
+        subscriptions.get(jobId)!.add(ws);
 
-        const { forecast, residuals } = new KalmanFilter1D().filter(rawData);
-        const clusters = this.runKMeans(residuals, k);
-        const cacheKey = `forecast:${Date.now()}`;
-        await this.cacheResult(cacheKey, { forecast, residuals, clusters });
-
-        await this.triggerAlertIfNeeded(clusters);
-        this.broadcastUpdate({ type: 'forecast', data: { forecast, residuals, clusters } });
-      } catch (err) {
-        this.emit('error', err);
-      }
-    });
-  }
-
-  /**
-   * Run K‑Means clustering on residuals.
-   * @param residuals Numeric array
-   * @param k Number of clusters
-   */
-  private runKMeans(residuals: number[], k: number) {
-    // ml‑kmeans expects a 2‑D array of points
-    const points = residuals.map((v) => [v]);
-    const result = kmeans(points, k);
-    // Transform result to a more convenient shape
-    return {
-      centroids: result.centroids.map((c) => c.centroid[0]),
-      assignments: result.clusters,
-    };
-  }
-
-  /**
-   * Cache result in Redis using LRU eviction (Redis must be configured with maxmemory-policy allkeys-lru).
+        // Optionally send current status if cached
+        if (resultCache.has(jobId)) {
+          ws.send(
+            JSON.stringify
