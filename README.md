@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Analytics API**](./projects/anomaly-correlation-analytics-api/) | `Data Science` | TypeScript / Node.js | Provides aggregated anomaly insights via Bayesian inference and STL forecasts. |
 | [**Anomaly Correlation Graph Analysis**](./projects/anomaly-correlation-graph-analysis/) | `Data Science` | TypeScript / Node.js | Detect and visualize anomaly clusters using graph traversal and community detection. |
 | [**Anomaly Correlation MLOps Orchestrator**](./projects/anomaly-correlation-mlops/) | `Data Science` | TypeScript / Node.js | Automates model training, evaluation, and deployment pipelines for anomaly correlation. |
 | [**Forecasting Engine**](./projects/anomaly-correlation-forecasting/) | `Data Science` | Node.js / TypeScript | Predict future anomalies using Kalman filter and STL. |
