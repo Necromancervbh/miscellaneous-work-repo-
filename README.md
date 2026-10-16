@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Prediction Service**](./projects/anomaly-correlation-prediction-service/) | `Data Science` | TypeScript / Python | Predict future anomaly scores using Kalman filter and Bayesian updating. |
 | [**Anomaly Correlation Data Ingestion Service**](./projects/anomaly-correlation-data-ingestion/) | `Data Science` | Node.js / TypeScript | Ingests, preprocesses, and streams sensor data for anomaly detection. |
 | [**Anomaly Correlation Analytics API**](./projects/anomaly-correlation-analytics-api/) | `Data Science` | TypeScript / Node.js | Provides aggregated anomaly insights via Bayesian inference and STL forecasts. |
 | [**Anomaly Correlation Graph Analysis**](./projects/anomaly-correlation-graph-analysis/) | `Data Science` | TypeScript / Node.js | Detect and visualize anomaly clusters using graph traversal and community detection. |
