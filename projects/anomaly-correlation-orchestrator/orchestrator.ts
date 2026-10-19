@@ -1,154 +1,153 @@
-import express, { Request, Response, NextFunction } from 'express';
-import { createServer } from 'http';
+import express, { Request, Response, NextFunction, Router } from 'express';
+import { Server as HttpServer } from 'http';
 import { Server as WebSocketServer, WebSocket } from 'ws';
-import rateLimit from 'express-rate-limit';
 import jwt, { JwtPayload } from 'jsonwebtoken';
-import { Queue, Worker, QueueScheduler, Job } from 'bullmq';
-import IORedis from 'ioredis';
 import LRUCache from 'lru-cache';
-import { body, validationResult } from 'express-validator';
+import { RateLimiterMemory } from 'rate-limiter-flexible';
 import { v4 as uuidv4 } from 'uuid';
-import dotenv from 'dotenv';
+import { predict } from './predictionEngine'; // Assume existing prediction engine
+import { EventPayload, PredictionResult, AlertMessage } from './types';
 
-// Load environment variables
-dotenv.config();
+// Configuration constants
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+const RATE_LIMIT_POINTS = Number(process.env.RATE_LIMIT_POINTS) || 10; // requests
+const RATE_LIMIT_DURATION = Number(process.env.RATE_LIMIT_DURATION) || 60; // seconds
+const CACHE_MAX_ITEMS = Number(process.env.CACHE_MAX_ITEMS) || 1000;
+const CACHE_MAX_AGE_MS = Number(process.env.CACHE_MAX_AGE_MS) || 5 * 60 * 1000; // 5 minutes
 
-const {
-  PORT = '3000',
-  JWT_SECRET = 'change_this_secret',
-  REDIS_URL = 'redis://localhost:6379',
-  RATE_LIMIT_WINDOW_MS = '60000',
-  RATE_LIMIT_MAX = '100',
-  LRU_MAX_ITEMS = '1000',
-  LRU_MAX_AGE_MS = '3600000', // 1 hour
-} = process.env;
-
-// Initialize Redis connection
-const redisConnection = new IORedis(REDIS_URL);
-
-// Initialize BullMQ components
-const queueName = 'anomaly-orchestrator-queue';
-const queue = new Queue(queueName, { connection: redisConnection });
-const queueScheduler = new QueueScheduler(queueName, { connection: redisConnection });
-
-// LRU Cache for results
-const resultCache = new LRUCache<string, any>({
-  max: Number(LRU_MAX_ITEMS),
-  ttl: Number(LRU_MAX_AGE_MS),
+// LRU Cache for prediction results
+// Cache key: `${userId}:${eventId}`
+// Value: PredictionResult
+const predictionCache = new LRUCache<string, PredictionResult>({
+  max: CACHE_MAX_ITEMS,
+  ttl: CACHE_MAX_AGE_MS,
 });
 
-// WebSocket subscription management
-type SubscriptionMap = Map<string, Set<WebSocket>>; // jobId -> Set of sockets
-const subscriptions: SubscriptionMap = new Map();
-
-// Import service modules (assumed to be present in the project)
-import { graphAnalysis } from './graphAnalysis';
-import { forecastService } from './forecastService';
-import { explainabilityService } from './explainabilityService';
-
-// Express app setup
-const app = express();
-app.use(express.json());
-
-// Rate limiter middleware
-const apiLimiter = rateLimit({
-  windowMs: Number(RATE_LIMIT_WINDOW_MS),
-  max: Number(RATE_LIMIT_MAX),
-  standardHeaders: true,
-  legacyHeaders: false,
+// Rate limiter per user (in-memory)
+const rateLimiter = new RateLimiterMemory({
+  points: RATE_LIMIT_POINTS,
+  duration: RATE_LIMIT_DURATION,
 });
-app.use(apiLimiter);
 
-// JWT authentication middleware
-interface AuthenticatedRequest extends Request {
-  user?: string | JwtPayload;
-}
-function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+// WebSocket client registry per user
+type ClientRegistry = Map<string, Set<WebSocket>>; // userId -> Set of sockets
+const wsClients: ClientRegistry = new Map();
+
+/**
+ * Middleware to validate JWT and attach userId to request.
+ */
+function jwtAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+    res.status(401).json({ error: 'Missing or malformed Authorization header' });
+    return;
   }
-  const token = authHeader.split(' ')[1];
+
+  const token = authHeader.slice(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
+    const payload = jwt.verify(token, JWT_SECRET) as JwtPayload;
+    if (!payload.sub) {
+      throw new Error('JWT payload missing subject');
+    }
+    // Attach user identifier to request for downstream use
+    (req as any).userId = payload.sub;
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid token' });
+    res.status(401).json({ error: 'Invalid token', details: (err as Error).message });
   }
 }
 
-// Input validation chain for job submission
-const jobValidation = [
-  body('payload')
-    .isObject()
-    .withMessage('payload must be an object')
-    .custom((value) => {
-      // Example: ensure required fields exist
-      if (!value?.data) {
-        throw new Error('payload must contain a data field');
-      }
-      return true;
-    }),
-];
+/**
+ * Middleware to enforce per‑user rate limiting.
+ */
+async function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const userId = (req as any).userId as string;
+  try {
+    await rateLimiter.consume(userId);
+    next();
+  } catch (rej) {
+    res.status(429).json({ error: 'Rate limit exceeded' });
+  }
+}
 
-// Route: Submit a new analysis job
-app.post(
-  '/jobs',
-  authenticateJWT,
-  jobValidation,
-  async (req: AuthenticatedRequest, res: Response) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+/**
+ * Validate incoming event payload.
+ * Throws an Error if validation fails.
+ */
+function validateEventPayload(body: any): asserts body is EventPayload {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('Payload must be a JSON object');
+  }
+  if (typeof body.eventId !== 'string' || body.eventId.trim() === '') {
+    throw new Error('eventId must be a non‑empty string');
+  }
+  if (typeof body.timestamp !== 'string' || isNaN(Date.parse(body.timestamp))) {
+    throw new Error('timestamp must be a valid ISO 8601 string');
+  }
+  if (typeof body.data !== 'object' || body.data === null) {
+    throw new Error('data must be an object');
+  }
+}
 
-    const jobId = uuidv4();
-    const payload = req.body.payload;
-
-    try {
-      await queue.add(
-        jobId,
-        { payload, jobId },
-        {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 5000 },
-          removeOnComplete: true,
-          removeOnFail: true,
-        },
-      );
-
-      // Initial broadcast: job queued
-      broadcastStatus(jobId, { status: 'queued' });
-
-      return res.status(202).json({ jobId });
-    } catch (err) {
-      console.error('Failed to enqueue job:', err);
-      return res.status(500).json({ error: 'Failed to enqueue job' });
-    }
-  },
-);
-
-// Route: Retrieve job result (from cache)
-app.get('/jobs/:jobId/result', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
-  const { jobId } = req.params;
-  if (!jobId) {
-    return res.status(400).json({ error: 'Missing jobId parameter' });
+/**
+ * Core handler for ingestion events.
+ */
+async function handleIngestion(req: Request, res: Response): Promise<void> {
+  const userId = (req as any).userId as string;
+  try {
+    validateEventPayload(req.body);
+  } catch (validationError) {
+    res.status(400).json({ error: (validationError as Error).message });
+    return;
   }
 
-  const cached = resultCache.get(jobId);
-  if (!cached) {
-    return res.status(404).json({ error: 'Result not found or not yet computed' });
+  const event: EventPayload = req.body;
+  const cacheKey = `${userId}:${event.eventId}`;
+
+  // Return cached prediction if present
+  const cached = predictionCache.get(cacheKey);
+  if (cached) {
+    res.json({ prediction: cached, cached: true });
+    return;
   }
 
-  return res.json({ jobId, result: cached });
-});
+  // Trigger prediction engine
+  let prediction: PredictionResult;
+  try {
+    prediction = await predict(event);
+  } catch (engineError) {
+    res.status(502).json({ error: 'Prediction engine failure', details: (engineError as Error).message });
+    return;
+  }
 
-// Helper: Broadcast status updates to subscribed WebSocket clients
-function broadcastStatus(jobId: string, message: any) {
-  const clients = subscriptions.get(jobId);
+  // Store in cache
+  predictionCache.set(cacheKey, prediction);
+
+  // Publish alert if anomaly detected (example condition)
+  if (prediction.anomalyScore !== undefined && prediction.anomalyScore > 0.8) {
+    const alert: AlertMessage = {
+      alertId: uuidv4(),
+      userId,
+      eventId: event.eventId,
+      timestamp: new Date().toISOString(),
+      severity: 'high',
+      message: `Anomaly detected with score ${prediction.anomalyScore}`,
+      payload: event,
+    };
+    broadcastAlert(userId, alert);
+  }
+
+  res.json({ prediction, cached: false });
+}
+
+/**
+ * Broadcast an alert to all WebSocket clients belonging to a user.
+ */
+function broadcastAlert(userId: string, alert: AlertMessage): void {
+  const clients = wsClients.get(userId);
   if (!clients) return;
-  const payload = JSON.stringify({ jobId, ...message });
+
+  const payload = JSON.stringify({ type: 'alert', data: alert });
   for (const ws of clients) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(payload);
@@ -156,71 +155,77 @@ function broadcastStatus(jobId: string, message: any) {
   }
 }
 
-// BullMQ worker to process jobs
-const worker = new Worker(
-  queueName,
-  async (job: Job) => {
-    const { payload, jobId } = job.data as { payload: any; jobId: string };
-    try {
-      broadcastStatus(jobId, { status: 'processing' });
+/**
+ * Initialize WebSocket server and attach connection handling.
+ */
+function initWebSocket(server: HttpServer): void {
+  const wss = new WebSocketServer({ server, path: '/ws' });
 
-      // 1. Graph analysis
-      // Formula: G = f(data) where f is the graph analysis algorithm
-      const graphResult = await graphAnalysis(payload);
-
-      // 2. Forecast service
-      // Formula: F = g(G) where g forecasts based on graph result
-      const forecastResult = await forecastService(graphResult);
-
-      // 3. Explainability service
-      // Formula: E = h(F) where h provides explanations for forecast
-      const explainabilityResult = await explainabilityService(forecastResult);
-
-      const combinedResult = {
-        graphResult,
-        forecastResult,
-        explainabilityResult,
-      };
-
-      // Store in LRU cache
-      resultCache.set(jobId, combinedResult);
-
-      // Broadcast completion
-      broadcastStatus(jobId, { status: 'completed', result: combinedResult });
-
-      return combinedResult;
-    } catch (err) {
-      console.error(`Job ${jobId} failed:`, err);
-      broadcastStatus(jobId, { status: 'failed', error: (err as Error).message });
-      throw err;
+  wss.on('connection', (ws: WebSocket, req) => {
+    // Expect JWT token as query param: ?token=...
+    const url = new URL(req.url ?? '', `http://${req.headers.host}`);
+    const token = url.searchParams.get('token');
+    if (!token) {
+      ws.close(4001, 'Missing token');
+      return;
     }
-  },
-  { connection: redisConnection },
-);
 
-worker.on('failed', (job, err) => {
-  if (job) {
-    broadcastStatus(job.id as string, { status: 'failed', error: err.message });
-  }
-});
-
-// HTTP server and WebSocket server setup
-const httpServer = createServer(app);
-const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
-
-wss.on('connection', (ws: WebSocket) => {
-  // Expect a subscription message: { type: 'subscribe', jobId: '...' }
-  ws.on('message', (data: WebSocket.Data) => {
+    let payload: JwtPayload;
     try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'subscribe' && typeof msg.jobId === 'string') {
-        const { jobId } = msg;
-        if (!subscriptions.has(jobId)) {
-          subscriptions.set(jobId, new Set());
-        }
-        subscriptions.get(jobId)!.add(ws);
+      payload = jwt.verify(token, JWT_SECRET) as JwtPayload;
+      if (!payload.sub) throw new Error('Missing subject');
+    } catch (err) {
+      ws.close(4002, 'Invalid token');
+      return;
+    }
 
-        // Optionally send current status if cached
-        if (resultCache.has(jobId)) {
-          ws.send(
-            JSON.stringify
+    const userId = payload.sub as string;
+    // Register client
+    if (!wsClients.has(userId)) {
+      wsClients.set(userId, new Set());
+    }
+    wsClients.get(userId)!.add(ws);
+
+    ws.on('close', () => {
+      wsClients.get(userId)!.delete(ws);
+      if (wsClients.get(userId)!.size === 0) {
+        wsClients.delete(userId);
+      }
+    });
+
+    ws.on('error', () => {
+      ws.close();
+    });
+  });
+}
+
+/**
+ * Create and configure the Express router for ingestion endpoint.
+ */
+function createRouter(): Router {
+  const router = Router();
+
+  router.use(express.json({ limit: '1mb' }));
+  router.use(jwtAuthMiddleware);
+  router.use(rateLimitMiddleware);
+  router.post('/ingest', handleIngestion);
+
+  // Health check endpoint (no auth)
+  router.get('/health', (_req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  return router;
+}
+
+/**
+ * Orchestrator initialization function.
+ * Call this from your main server bootstrap file.
+ *
+ * @param app Express application instance.
+ * @param httpServer Underlying HTTP server (required for WebSocket upgrade).
+ */
+export function initOrchestrator(app: express.Application, httpServer: HttpServer): void {
+  // Attach router
+  const router = createRouter();
+  app.use('/api
