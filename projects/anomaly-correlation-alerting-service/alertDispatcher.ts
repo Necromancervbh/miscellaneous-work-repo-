@@ -1,237 +1,227 @@
-import { Server as WebSocketServer, WebSocket } from 'ws';
-import jwt, { JwtPayload } from 'jsonwebtoken';
-import LRUCache from 'lru-cache';
 import { EventEmitter } from 'events';
-import { setTimeout as delay } from 'timers/promises';
+import { createServer, Server as HttpServer } from 'http';
+import WebSocket, { WebSocketServer, WebSocket as WSClient } from 'ws';
+import LRUCache from 'lru-cache';
 
 /**
- * Types
+ * Interface representing a correlation score emitted by the orchestrator.
  */
-export interface PredictorEvent {
-    timestamp: number; // Unix epoch ms
-    anomalies: Anomaly[];
-    [key: string]: any;
-}
-
-export interface Anomaly {
-    id: string;
-    x: number; // feature dimension 1
-    y: number; // feature dimension 2
-    severity: number;
-    [key: string]: any;
-}
-
-export interface Alert {
-    clusterId: number;
-    anomalies: Anomaly[];
-    generatedAt: number;
+export interface CorrelationScore {
+  /** Unique identifier of the score event (e.g., UUID). */
+  id: string;
+  /** Numeric correlation score (e.g., 0.0 – 1.0). */
+  score: number;
+  /** Type/category of the correlation (used for threshold lookup). */
+  type: string;
+  /** ISO‑8601 timestamp of when the score was generated. */
+  timestamp: string;
+  /** Arbitrary payload containing additional context. */
+  details?: Record<string, unknown>;
 }
 
 /**
- * DBSCAN clustering implementation
+ * Configuration options for the AlertDispatcher.
  */
-class DBSCAN {
-    private eps: number;
-    private minPts: number;
-
-    constructor(eps: number, minPts: number) {
-        if (eps <= 0) throw new Error('eps must be > 0');
-        if (minPts <= 0) throw new Error('minPts must be > 0');
-        this.eps = eps;
-        this.minPts = minPts;
-    }
-
-    /**
-     * Euclidean distance between two points.
-     * d(p,q) = sqrt((p.x - q.x)^2 + (p.y - q.y)^2)
-     */
-    private distance(p: Anomaly, q: Anomaly): number {
-        const dx = p.x - q.x;
-        const dy = p.y - q.y;
-        return Math.sqrt(dx * dx + dy * dy);
-    }
-
-    /**
-     * Returns indices of points within eps of point i.
-     */
-    private regionQuery(points: Anomaly[], i: number): number[] {
-        const neighbors: number[] = [];
-        for (let j = 0; j < points.length; j++) {
-            if (this.distance(points[i], points[j]) <= this.eps) {
-                neighbors.push(j);
-            }
-        }
-        return neighbors;
-    }
-
-    /**
-     * Performs DBSCAN clustering.
-     * Returns an array where each element is the cluster id (>=0) or -1 for noise.
-     */
-    public run(points: Anomaly[]): number[] {
-        const labels = new Array(points.length).fill(-1); // -1 = unvisited/noise
-        let clusterId = 0;
-
-        for (let i = 0; i < points.length; i++) {
-            if (labels[i] !== -1) continue; // already processed
-
-            const neighbors = this.regionQuery(points, i);
-            if (neighbors.length < this.minPts) {
-                labels[i] = -1; // noise
-                continue;
-            }
-
-            // Expand cluster
-            this.expandCluster(points, labels, i, neighbors, clusterId);
-            clusterId++;
-        }
-
-        return labels;
-    }
-
-    private expandCluster(
-        points: Anomaly[],
-        labels: number[],
-        pointIdx: number,
-        neighbors: number[],
-        clusterId: number
-    ): void {
-        labels[pointIdx] = clusterId;
-        const queue = [...neighbors];
-
-        while (queue.length > 0) {
-            const currentIdx = queue.shift()!;
-            if (labels[currentIdx] === -1) {
-                // Previously labeled as noise, now part of cluster
-                labels[currentIdx] = clusterId;
-            }
-            if (labels[currentIdx] !== -1) continue; // already assigned to a cluster
-
-            labels[currentIdx] = clusterId;
-            const currentNeighbors = this.regionQuery(points, currentIdx);
-            if (currentNeighbors.length >= this.minPts) {
-                queue.push(...currentNeighbors);
-            }
-        }
-    }
+export interface AlertDispatcherConfig {
+  /** Mapping from correlation type to the minimum score required to raise an alert. */
+  thresholds: Record<string, number>;
+  /** Maximum number of recent alerts to keep for de‑duplication. */
+  cacheSize: number;
+  /** Port on which the WebSocket server will listen. */
+  wsPort: number;
+  /** Optional HTTP server (useful for integration with existing servers). */
+  httpServer?: HttpServer;
 }
 
 /**
- * Rate limiter per client using token bucket algorithm.
+ * Alert message sent to subscribed WebSocket clients.
  */
-class TokenBucket {
-    private capacity: number;
-    private tokens: number;
-    private refillRate: number; // tokens per ms
-    private lastRefill: number;
-
-    constructor(capacity: number, refillPerSecond: number) {
-        if (capacity <= 0) throw new Error('Bucket capacity must be > 0');
-        if (refillPerSecond <= 0) throw new Error('Refill rate must be > 0');
-        this.capacity = capacity;
-        this.tokens = capacity;
-        this.refillRate = refillPerSecond / 1000;
-        this.lastRefill = Date.now();
-    }
-
-    private refill(): void {
-        const now = Date.now();
-        const elapsed = now - this.lastRefill;
-        const added = elapsed * this.refillRate;
-        this.tokens = Math.min(this.capacity, this.tokens + added);
-        this.lastRefill = now;
-    }
-
-    public tryRemove(tokens: number = 1): boolean {
-        this.refill();
-        if (this.tokens >= tokens) {
-            this.tokens -= tokens;
-            return true;
-        }
-        return false;
-    }
+export interface AlertMessage {
+  /** CorrelationScore that triggered the alert. */
+  score: CorrelationScore;
+  /** Human‑readable message. */
+  message: string;
 }
 
 /**
- * Main dispatcher class.
+ * Service that consumes correlation scores, applies thresholds, de‑duplicates alerts,
+ * and publishes them via WebSocket.
  */
-export class AlertDispatcher {
-    private wss: WebSocketServer;
-    private jwtSecret: string;
-    private dbscan: DBSCAN;
-    private alertCache: LRUCache<string, Alert>;
-    private clientBuckets: Map<string, TokenBucket>;
-    private maxTokensPerSecond: number;
-    private bucketCapacity: number;
-    private eventEmitter: EventEmitter;
+export class AlertDispatcher extends EventEmitter {
+  private readonly thresholds: Record<string, number>;
+  private readonly cache: LRUCache<string, true>;
+  private readonly wss: WebSocketServer;
+  private readonly clients: Set<WSClient> = new Set();
 
-    /**
-     * @param wss WebSocket server instance.
-     * @param jwtSecret Secret used to verify JWT tokens.
-     * @param eps DBSCAN epsilon distance.
-     * @param minPts DBSCAN minimum points.
-     * @param cacheSize Maximum number of alerts to keep in LRU cache.
-     * @param bucketCapacity Maximum burst size for rate limiting.
-     * @param maxTokensPerSecond Refill rate for token bucket.
-     */
-    constructor(
-        wss: WebSocketServer,
-        jwtSecret: string,
-        eps: number = 0.5,
-        minPts: number = 3,
-        cacheSize: number = 500,
-        bucketCapacity: number = 10,
-        maxTokensPerSecond: number = 5
-    ) {
-        if (!wss) throw new Error('WebSocketServer instance required');
-        if (!jwtSecret) throw new Error('JWT secret required');
+  /**
+   * Constructs a new AlertDispatcher.
+   * @param config Configuration object.
+   * @throws Error if validation fails.
+   */
+  constructor(private readonly config: AlertDispatcherConfig) {
+    super();
+    this.validateConfig(config);
+    this.thresholds = { ...config.thresholds };
+    this.cache = new LRUCache<string, true>({ max: config.cacheSize });
 
-        this.wss = wss;
-        this.jwtSecret = jwtSecret;
-        this.dbscan = new DBSCAN(eps, minPts);
-        this.alertCache = new LRUCache<string, Alert>({ max: cacheSize });
-        this.clientBuckets = new Map();
-        this.bucketCapacity = bucketCapacity;
-        this.maxTokensPerSecond = maxTokensPerSecond;
-        this.eventEmitter = new EventEmitter();
+    // Initialise WebSocket server (reuse provided HTTP server if any)
+    this.wss = new WebSocketServer({
+      port: config.wsPort,
+      server: config.httpServer,
+    });
 
-        this.setupWebSocketHandlers();
+    this.wss.on('connection', (ws: WSClient) => this.handleConnection(ws));
+    this.wss.on('error', (err) => this.emit('error', err));
+  }
+
+  /**
+   * Validates the configuration object.
+   * @param cfg Configuration to validate.
+   * @throws Error if any required field is missing or malformed.
+   */
+  private validateConfig(cfg: AlertDispatcherConfig): void {
+    if (!cfg) {
+      throw new Error('Configuration object is required.');
+    }
+    if (typeof cfg.wsPort !== 'number' || cfg.wsPort <= 0 || cfg.wsPort > 65535) {
+      throw new Error('wsPort must be a valid TCP port number.');
+    }
+    if (!cfg.thresholds || typeof cfg.thresholds !== 'object') {
+      throw new Error('thresholds must be a non‑empty object mapping types to numbers.');
+    }
+    for (const [type, value] of Object.entries(cfg.thresholds)) {
+      if (typeof value !== 'number' || isNaN(value)) {
+        throw new Error(`Threshold for type "${type}" must be a valid number.`);
+      }
+    }
+    if (typeof cfg.cacheSize !== 'number' || cfg.cacheSize <= 0) {
+      throw new Error('cacheSize must be a positive integer.');
+    }
+  }
+
+  /**
+   * Handles a new WebSocket client connection.
+   * @param ws The connected client.
+   */
+  private handleConnection(ws: WSClient): void {
+    this.clients.add(ws);
+    ws.on('close', () => this.clients.delete(ws));
+    ws.on('error', (err) => this.emit('clientError', err));
+  }
+
+  /**
+   * Consumes a correlation score from the orchestrator.
+   * Performs validation, threshold check, de‑duplication, and dispatch.
+   * @param score The incoming correlation score.
+   */
+  public async dispatchScore(score: CorrelationScore): Promise<void> {
+    try {
+      this.validateScore(score);
+    } catch (err) {
+      this.emit('error', err);
+      return;
     }
 
-    /**
-     * Handles incoming predictor events.
-     */
-    public async handleEvent(event: PredictorEvent): Promise<void> {
-        if (!event || typeof event.timestamp !== 'number' || !Array.isArray(event.anomalies)) {
-            throw new Error('Invalid PredictorEvent structure');
-        }
+    // De‑duplication: skip if already processed
+    if (this.cache.has(score.id)) {
+      return;
+    }
 
-        const anomalies = event.anomalies;
-        if (anomalies.length === 0) return; // nothing to process
+    // Threshold evaluation:
+    // Alert is raised if score >= threshold(type)
+    //   score >= thresholds[type]
+    const threshold = this.thresholds[score.type];
+    if (threshold === undefined) {
+      // No configured threshold for this type → ignore
+      return;
+    }
 
-        const clusterLabels = this.dbscan.run(anomalies);
-        const clusters = new Map<number, Anomaly[]>();
+    if (score.score >= threshold) {
+      const alertMsg: AlertMessage = {
+        score,
+        message: `Alert: ${score.type} scored ${score.score.toFixed(3)} (threshold ${threshold})`,
+      };
+      this.broadcastAlert(alertMsg);
+      this.cache.set(score.id, true);
+    }
+  }
 
-        clusterLabels.forEach((label, idx) => {
-            if (label === -1) return; // ignore noise
-            if (!clusters.has(label)) clusters.set(label, []);
-            clusters.get(label)!.push(anomalies[idx]);
+  /**
+   * Validates the structure and values of a CorrelationScore.
+   * @param score Score to validate.
+   * @throws Error if validation fails.
+   */
+  private validateScore(score: CorrelationScore): void {
+    if (!score || typeof score !== 'object') {
+      throw new Error('CorrelationScore must be an object.');
+    }
+    if (typeof score.id !== 'string' || score.id.trim() === '') {
+      throw new Error('CorrelationScore.id must be a non‑empty string.');
+    }
+    if (typeof score.type !== 'string' || score.type.trim() === '') {
+      throw new Error('CorrelationScore.type must be a non‑empty string.');
+    }
+    if (typeof score.score !== 'number' || isNaN(score.score)) {
+      throw new Error('CorrelationScore.score must be a valid number.');
+    }
+    if (typeof score.timestamp !== 'string' || isNaN(Date.parse(score.timestamp))) {
+      throw new Error('CorrelationScore.timestamp must be a valid ISO‑8601 string.');
+    }
+    // details is optional; no validation needed
+  }
+
+  /**
+   * Broadcasts an alert to all connected WebSocket clients.
+   * @param alert AlertMessage to send.
+   */
+  private broadcastAlert(alert: AlertMessage): void {
+    const payload = JSON.stringify(alert);
+    for (const client of this.clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload, (err) => {
+          if (err) {
+            this.emit('clientError', err);
+          }
         });
-
-        for (const [clusterId, clusterAnomalies] of clusters.entries()) {
-            const alertKey = this.generateAlertKey(clusterId, clusterAnomalies);
-            if (this.alertCache.has(alertKey)) continue; // duplicate recent alert
-
-            const alert: Alert = {
-                clusterId,
-                anomalies: clusterAnomalies,
-                generatedAt: Date.now(),
-            };
-            this.alertCache.set(alertKey, alert);
-            this.enqueueAlert(alert);
-        }
+      }
     }
+  }
 
-    /**
-     * Generates a deterministic key for an alert to be stored in LRU cache.
-     * Uses sorted anomaly IDs to ensure identical clusters map
+  /**
+   * Gracefully shuts down the dispatcher, closing all client connections
+   * and the underlying WebSocket server.
+   * @returns Promise that resolves when shutdown completes.
+   */
+  public async shutdown(): Promise<void> {
+    // Close all client sockets
+    for (const client of this.clients) {
+      try {
+        client.terminate();
+      } catch {
+        // ignore errors during termination
+      }
+    }
+    this.clients.clear();
+
+    // Close WebSocket server
+    await new Promise<void>((resolve, reject) => {
+      this.wss.close((err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+}
+
+/**
+ * Example usage (commented out for library consumption):
+ *
+ * const dispatcher = new AlertDispatcher({
+ *   wsPort: 8080,
+ *   cacheSize: 1000,
+ *   thresholds: { cpu: 0.8, memory: 0.75 },
+ * });
+ *
+ * // Simulate incoming scores
+ * dispatcher.dispatchScore({
+ *   id:
