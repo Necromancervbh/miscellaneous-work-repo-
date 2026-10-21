@@ -1,212 +1,226 @@
-import express, { Request, Response, NextFunction } from 'express';
-import { json } from 'body-parser';
+import express, { Request, Response, NextFunction, Application } from 'express';
 import jwt, { JwtPayload } from 'jsonwebtoken';
-import { body, validationResult } from 'express-validator';
-import LRUCache from 'lru-cache';
-import { Queue, Worker, QueueScheduler, Job } from 'bullmq';
+import { Queue, QueueScheduler, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
+import LRUCache from 'lru-cache';
+import { WebSocketServer, WebSocket } from 'ws';
+import http from 'http';
+import { URL } from 'url';
 import crypto from 'crypto';
-import dotenv from 'dotenv';
 
-// Load environment variables
-dotenv.config();
+// ---------- Configuration ----------
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+const PORT = Number(process.env.PORT) || 3000;
 
-const {
-    PORT = '3000',
-    JWT_SECRET = 'your-secret-key',
-    REDIS_URL = 'redis://127.0.0.1:6379',
-    CACHE_MAX_ITEMS = '500',
-    CACHE_MAX_AGE_MS = '600000', // 10 minutes
-    ALERT_BUCKET_CAPACITY = '10',
-    ALERT_BUCKET_REFILL_RATE = '1', // tokens per second
-} = process.env;
+// Rate limiter settings (tokens per interval)
+const RATE_LIMIT_CAPACITY = Number(process.env.RATE_LIMIT_CAPACITY) || 100;
+const RATE_LIMIT_REFILL_INTERVAL_MS = Number(process.env.RATE_LIMIT_REFILL_INTERVAL_MS) || 60_000; // 1 minute
 
-// Types
+// LRU cache settings
+const CACHE_MAX_ITEMS = Number(process.env.CACHE_MAX_ITEMS) || 500;
+const CACHE_MAX_AGE_MS = Number(process.env.CACHE_MAX_AGE_MS) || 5 * 60_1000; // 5 minutes
+
+// ---------- Types ----------
 interface AuthenticatedRequest extends Request {
-    user?: JwtPayload | string;
+  user?: { id: string };
 }
 
-// JWT Authentication Middleware
-function jwtAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-    const authHeader = req.headers['authorization'];
-    if (!authHeader) {
-        return res.status(401).json({ error: 'Missing Authorization header' });
-    }
-
-    const tokenMatch = authHeader.match(/^Bearer (.+)$/);
-    if (!tokenMatch) {
-        return res.status(401).json({ error: 'Invalid Authorization format' });
-    }
-
-    const token = tokenMatch[1];
-    try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        req.user = payload;
-        next();
-    } catch (err) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-}
-
-// LRU Cache for recent predictions
-const predictionCache = new LRUCache<string, any>({
-    max: Number(CACHE_MAX_ITEMS),
-    ttl: Number(CACHE_MAX_AGE_MS),
-});
-
-// Token Bucket Rate Limiter for alerts
+// Token bucket per user
 class TokenBucket {
-    private capacity: number;
-    private tokens: number;
-    private refillRate: number; // tokens per millisecond
-    private lastRefill: number;
+  private tokens: number;
+  private lastRefill: number;
+  private readonly capacity: number;
+  private readonly refillInterval: number; // ms
+  private readonly refillAmount: number;
 
-    constructor(capacity: number, refillPerSecond: number) {
-        this.capacity = capacity;
-        this.tokens = capacity;
-        this.refillRate = refillPerSecond / 1000;
-        this.lastRefill = Date.now();
-    }
+  constructor(capacity: number, refillInterval: number) {
+    this.capacity = capacity;
+    this.refillInterval = refillInterval;
+    this.refillAmount = capacity; // full refill each interval
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
 
-    private refill() {
-        const now = Date.now();
-        const elapsed = now - this.lastRefill;
-        const added = elapsed * this.refillRate;
-        this.tokens = Math.min(this.capacity, this.tokens + added);
-        this.lastRefill = now;
+  /**
+   * Attempts to consume a token.
+   * @returns true if token was consumed, false otherwise.
+   */
+  public tryConsume(): boolean {
+    this.refill();
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
     }
+    return false;
+  }
 
-    public tryRemoveTokens(count: number): boolean {
-        this.refill();
-        if (this.tokens >= count) {
-            this.tokens -= count;
-            return true;
-        }
-        return false;
+  /**
+   * Refill tokens based on elapsed time.
+   * Formula: tokens = min(capacity, tokens + (elapsed / interval) * refillAmount)
+   */
+  private refill(): void {
+    const now = Date.now();
+    const elapsed = now - this.lastRefill;
+    if (elapsed >= this.refillInterval) {
+      const intervals = Math.floor(elapsed / this.refillInterval);
+      this.tokens = Math.min(this.capacity, this.tokens + intervals * this.refillAmount);
+      this.lastRefill += intervals * this.refillInterval;
     }
+  }
 }
 
-// Map of user identifier -> TokenBucket
-const alertBuckets = new Map<string, TokenBucket>();
+// ---------- Global Instances ----------
+const app: Application = express();
+app.use(express.json());
 
-function alertRateLimiter(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-    const userId = typeof req.user === 'object' && req.user?.sub ? String(req.user.sub) : req.ip;
-    let bucket = alertBuckets.get(userId);
-    if (!bucket) {
-        bucket = new TokenBucket(
-            Number(ALERT_BUCKET_CAPACITY),
-            Number(ALERT_BUCKET_REFILL_RATE)
-        );
-        alertBuckets.set(userId, bucket);
-    }
+// Redis connection for BullMQ
+const redisConnection = new IORedis(REDIS_URL);
 
-    if (bucket.tryRemoveTokens(1)) {
-        next();
-    } else {
-        res.status(429).json({ error: 'Rate limit exceeded for alerts' });
-    }
-}
+// BullMQ queue for heavy analytics
+const analyticsQueue = new Queue('analytics', { connection: redisConnection });
+new QueueScheduler('analytics', { connection: redisConnection }); // ensures delayed/retry handling
 
-// BullMQ setup
-const connection = new IORedis(REDIS_URL);
-const predictionQueue = new Queue('predictionQueue', { connection });
-const scheduler = new QueueScheduler('predictionQueue', { connection });
-
-// Worker to process predictions asynchronously
-const predictionWorker = new Worker(
-    'predictionQueue',
-    async (job: Job) => {
-        // Simulate heavy prediction computation
-        // For demonstration, we just hash the input data
-        const input = job.data.input;
-        const result = crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
-
-        // Store result in cache
-        const cacheKey = job.id as string;
-        predictionCache.set(cacheKey, result);
-
-        return { result };
-    },
-    { connection }
+// Worker processing analytics jobs (example placeholder)
+new Worker(
+  'analytics',
+  async (job: Job) => {
+    // Simulate heavy computation
+    await new Promise((res) => setTimeout(res, 2000));
+    // In a real implementation, process job.data here
+    return { status: 'completed', result: `Processed ${JSON.stringify(job.data)}` };
+  },
+  { connection: redisConnection }
 );
 
-predictionWorker.on('failed', (job, err) => {
-    console.error(`Job ${job?.id} failed:`, err);
+// LRU cache for recent query results
+const queryCache = new LRUCache<string, any>({
+  max: CACHE_MAX_ITEMS,
+  ttl: CACHE_MAX_AGE_MS,
 });
 
-// Express app setup
-const app = express();
-app.use(json());
+// Token bucket map per userId
+const tokenBuckets = new Map<string, TokenBucket>();
 
-// Global error handler
-app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-});
-
-// Helper to generate deterministic cache key from request payload
-function generateCacheKey(payload: any): string {
-    // Formula: key = SHA256(JSON.stringify(payload))
-    return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+// ---------- Middleware ----------
+function jwtAuthMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+  }
+  const token = authHeader.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as JwtPayload;
+    if (!payload.sub) {
+      throw new Error('Token missing subject');
+    }
+    req.user = { id: payload.sub };
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token', details: (err as Error).message });
+  }
 }
 
-// /predict endpoint
-app.post(
-    '/predict',
-    jwtAuth,
-    body('data').exists().withMessage('data field is required'),
-    async (req: AuthenticatedRequest, res: Response) => {
-        const errors = validationResult(req);
-        if (!errors.isEmpty()) {
-            return res.status(400).json({ errors: errors.array() });
-        }
+function rateLimiterMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.user) {
+    // Should never happen because jwtAuthMiddleware runs before
+    return res.status(500).json({ error: 'User not identified for rate limiting' });
+  }
+  const userId = req.user.id;
+  let bucket = tokenBuckets.get(userId);
+  if (!bucket) {
+    bucket = new TokenBucket(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_INTERVAL_MS);
+    tokenBuckets.set(userId, bucket);
+  }
+  if (!bucket.tryConsume()) {
+    return res.status(429).json({ error: 'Rate limit exceeded' });
+  }
+  next();
+}
 
-        const inputData = req.body.data;
-        const cacheKey = generateCacheKey(inputData);
-
-        // Check cache first
-        const cachedResult = predictionCache.get(cacheKey);
-        if (cachedResult) {
-            return res.json({ cached: true, result: cachedResult });
-        }
-
-        try {
-            const job = await predictionQueue.add('predict', { input: inputData }, { jobId: cacheKey });
-            return res.json({ jobId: job.id, queued: true });
-        } catch (err) {
-            console.error('Failed to enqueue prediction job:', err);
-            return res.status(500).json({ error: 'Failed to queue prediction' });
-        }
+// ---------- Routes ----------
+app.get(
+  '/data',
+  jwtAuthMiddleware,
+  rateLimiterMiddleware,
+  async (req: AuthenticatedRequest, res: Response) => {
+    const query = req.query.q;
+    if (typeof query !== 'string' || query.trim() === '') {
+      return res.status(400).json({ error: 'Missing or invalid query parameter "q"' });
     }
-);
 
-// /dashboard endpoint
-app.get('/dashboard', jwtAuth, async (_req: AuthenticatedRequest, res: Response) => {
+    const cacheKey = crypto.createHash('sha256').update(query).digest('hex');
+    const cached = queryCache.get(cacheKey);
+    if (cached) {
+      return res.json({ source: 'cache', data: cached });
+    }
+
     try {
-        const [waiting, active, completed, failed, delayed] = await Promise.all([
-            predictionQueue.getWaitingCount(),
-            predictionQueue.getActiveCount(),
-            predictionQueue.getCompletedCount(),
-            predictionQueue.getFailedCount(),
-            predictionQueue.getDelayedCount(),
-        ]);
-
-        const cacheInfo = {
-            size: predictionCache.size,
-            maxSize: predictionCache.max,
-            ttl: predictionCache.ttl,
-        };
-
-        return res.json({
-            queue: {
-                waiting,
-                active,
-                completed,
-                failed,
-                delayed,
-            },
-            cache: cacheInfo,
-        });
+      // Simulated data fetch – replace with real logic
+      const fetchedData = { result: `Result for ${query}`, timestamp: Date.now() };
+      queryCache.set(cacheKey, fetchedData);
+      res.json({ source: 'origin', data: fetchedData });
     } catch (err) {
-        console.error('Dashboard error:', err);
-        return res.status(500).json({ error: 'Failed to retrieve dashboard data' });
+      res.status(500).json({ error: 'Failed to fetch data', details: (err as Error).message });
+    }
+  }
+);
+
+app.post(
+  '/analytics',
+  jwtAuthMiddleware,
+  rateLimiterMiddleware,
+  async (req: AuthenticatedRequest, res: Response) => {
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'Invalid request body' });
+    }
+
+    try {
+      const job = await analyticsQueue.add('run', { userId: req.user?.id, payload });
+      res.status(202).json({ jobId: job.id, status: 'queued' });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to enqueue analytics job', details: (err as Error).message });
+    }
+  }
+);
+
+// ---------- WebSocket Hub ----------
+type Subscription = {
+  ws: WebSocket;
+  topics: Set<string>;
+};
+
+class WebSocketHub {
+  private wss: WebSocketServer;
+  private subscriptions: Set<Subscription> = new Set();
+
+  constructor(server: http.Server) {
+    this.wss = new WebSocketServer({ server });
+    this.wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
+      const sub: Subscription = { ws, topics: new Set() };
+      this.subscriptions.add(sub);
+
+      ws.on('message', (data: WebSocket.Data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.action === 'subscribe' && typeof msg.topic === 'string') {
+            sub.topics.add(msg.topic);
+          } else if (msg.action === 'unsubscribe' && typeof msg.topic === 'string') {
+            sub.topics.delete(msg.topic);
+          } else {
+            ws.send(JSON.stringify({ error: 'Invalid message format' }));
+          }
+        } catch {
+          ws.send(JSON.stringify({ error: 'Malformed JSON' }));
+        }
+      });
+
+      ws.on('close', () => {
+        this.subscriptions.delete(sub);
+      });
+    });
+  }
+
+  /**
+   * Broadcasts a
