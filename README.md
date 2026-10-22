@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Model Trainer**](./projects/anomaly-correlation-model-trainer/) | `Data Science` | TypeScript/Node.js/Python | Automated training pipeline for Kalman filter and Bayesian models. |
 | [**Anomaly Correlation Data Ingestion Service**](./projects/anomaly-correlation-ingestion/) | `Data Science` | TypeScript / Node.js | Stream, clean, and enrich sensor streams for downstream anomaly services. |
 | [**Anomaly Correlation Explainability Service**](./projects/anomaly-correlation-explainability-service/) | `Data Science` | Node.js / TypeScript / Python | Generates interpretable insights for anomaly correlation predictions. |
 | [**Anomaly Correlation Prediction Service**](./projects/anomaly-correlation-prediction-service/) | `Data Science` | TypeScript / Python | Predict future anomaly scores using Kalman filter and Bayesian updating. |
