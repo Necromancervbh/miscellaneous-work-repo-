@@ -1,174 +1,169 @@
-import express, { Request, Response, NextFunction } from 'express';
-import LRUCache from 'lru-cache';
-import { beta } from 'jstat';
+import express, { Request, Response, NextFunction, Router } from 'express';
+import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
+import Redis from 'ioredis';
+import * as tf from '@tensorflow/tfjs-node';
+import WebSocket, { Server as WebSocketServer } from 'ws';
+import { param, validationResult } from 'express-validator';
+import dotenv from 'dotenv';
 
-// Types
-interface AnomalyData {
-  successes: number; // number of observed normal events
-  failures: number; // number of observed anomalous events
-}
-
-interface PosteriorResult {
-  alpha: number;
-  beta: number;
-  mean: number;
-  credibleInterval: {
-    lower: number;
-    upper: number;
-  };
-}
-
-interface Explanation {
-  anomalyId: string;
-  posterior: PosteriorResult;
-}
-
-// Configuration
-const PRIOR_ALPHA = 1; // Uniform prior
-const PRIOR_BETA = 1;
-const CREDIBLE_LEVEL = 0.95; // 95% credible interval
-const CACHE_MAX_ITEMS = 500;
-const CACHE_MAX_AGE_MS = 1000 * 60 * 60; // 1 hour
-
-// LRU Cache for explanations
-const explanationCache = new LRUCache<string, Explanation>({
-  max: CACHE_MAX_ITEMS,
-  ttl: CACHE_MAX_AGE_MS,
-});
-
-// Mock data retrieval – replace with real DB/service call
-async function getAnomalyData(anomalyId: string): Promise<AnomalyData> {
-  // Simulate async I/O latency
-  await new Promise((resolve) => setTimeout(resolve, 10));
-
-  // For demonstration, generate pseudo‑random counts based on the ID hash
-  const hash = anomalyId
-    .split('')
-    .reduce((acc, char) => acc + char.charCodeAt(0), 0);
-  const successes = (hash * 7) % 100 + 1;
-  const failures = (hash * 13) % 100 + 1;
-  return { successes, failures };
-}
+dotenv.config();
 
 /**
- * Compute Bayesian posterior for a Beta‑Bernoulli model.
- *
- * Prior: Beta(α₀, β₀)
- * Likelihood: successes ~ Binomial(n, θ)
- * Posterior: Beta(α₀ + successes, β₀ + failures)
- *
- * @param priorAlpha α₀
- * @param priorBeta β₀
- * @param successes number of observed successes
- * @param failures number of observed failures
- * @returns Posterior parameters, mean, and credible interval
+ * Configuration
  */
-function computePosterior(
-  priorAlpha: number,
-  priorBeta: number,
-  successes: number,
-  failures: number
-): PosteriorResult {
-  const alphaPost = priorAlpha + successes;
-  const betaPost = priorBeta + failures;
-
-  // Posterior mean: E[θ] = α / (α + β)
-  const mean = alphaPost / (alphaPost + betaPost);
-
-  // Credible interval using Beta quantiles
-  const lowerQuantile = (1 - CREDIBLE_LEVEL) / 2;
-  const upperQuantile = 1 - lowerQuantile;
-
-  const lower = beta.inv(lowerQuantile, alphaPost, betaPost);
-  const upper = beta.inv(upperQuantile, alphaPost, betaPost);
-
-  return {
-    alpha: alphaPost,
-    beta: betaPost,
-    mean,
-    credibleInterval: {
-      lower,
-      upper,
-    },
-  };
-}
-
-// Middleware for async error handling
-function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any>) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    fn(req, res, next).catch(next);
-  };
-}
-
-// Express router
-const router = express.Router();
+const JWT_SECRET = process.env.JWT_SECRET ?? 'your_jwt_secret';
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379';
+const MODEL_PATH = process.env.MODEL_PATH ?? './model/model.json';
+const WS_PORT = Number(process.env.WS_PORT ?? 8081);
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS ?? 300); // 5 minutes
 
 /**
- * POST /explain
- * Body: { anomalyIds: string[] }
- * Returns: { explanations: Explanation[] }
+ * Redis client – LRU eviction is configured on the Redis server side (maxmemory-policy allkeys-lru)
  */
-router.post(
-  '/explain',
-  asyncHandler(async (req: Request, res: Response) => {
-    const { anomalyIds } = req.body;
+const redis = new Redis(REDIS_URL);
 
-    // Input validation
-    if (!Array.isArray(anomalyIds) || anomalyIds.length === 0) {
-      return res.status(400).json({ error: 'anomalyIds must be a non‑empty array.' });
-    }
-    if (!anomalyIds.every((id) => typeof id === 'string' && id.trim().length > 0)) {
-      return res
-        .status(400)
-        .json({ error: 'Each anomalyId must be a non‑empty string.' });
-    }
+/**
+ * Load TensorFlow.js model once at startup.
+ */
+let model: tf.LayersModel;
+(async () => {
+  try {
+    model = await tf.loadLayersModel(`file://${MODEL_PATH}`);
+    console.log('Model loaded successfully.');
+  } catch (err) {
+    console.error('Failed to load model:', err);
+    process.exit(1);
+  }
+})();
 
-    const explanations: Explanation[] = [];
+/**
+ * WebSocket server for notifications.
+ * Maintains a map of userId -> Set of WebSocket connections.
+ */
+class NotificationHub {
+  private wss: WebSocketServer;
+  private userSockets: Map<string, Set<WebSocket>> = new Map();
 
-    for (const anomalyId of anomalyIds) {
-      // Check cache first
-      const cached = explanationCache.get(anomalyId);
-      if (cached) {
-        explanations.push(cached);
-        continue;
+  constructor(port: number) {
+    this.wss = new WebSocketServer({ port });
+    this.wss.on('connection', (ws: WebSocket, req) => {
+      const token = this.extractTokenFromQuery(req.url ?? '');
+      if (!token) {
+        ws.close(4001, 'Missing token');
+        return;
       }
-
-      // Retrieve data
-      let data: AnomalyData;
+      let payload: any;
       try {
-        data = await getAnomalyData(anomalyId);
-      } catch (err) {
-        // If data retrieval fails, skip this ID but log the error
-        console.error(`Failed to retrieve data for anomalyId ${anomalyId}:`, err);
-        continue;
+        payload = jwt.verify(token, JWT_SECRET);
+      } catch {
+        ws.close(4002, 'Invalid token');
+        return;
       }
+      const userId = payload.sub;
+      if (!userId) {
+        ws.close(4003, 'Missing subject in token');
+        return;
+      }
+      if (!this.userSockets.has(userId)) {
+        this.userSockets.set(userId, new Set());
+      }
+      this.userSockets.get(userId)!.add(ws);
 
-      // Compute posterior
-      const posterior = computePosterior(
-        PRIOR_ALPHA,
-        PRIOR_BETA,
-        data.successes,
-        data.failures
-      );
+      ws.on('close', () => {
+        this.userSockets.get(userId)!.delete(ws);
+        if (this.userSockets.get(userId)!.size === 0) {
+          this.userSockets.delete(userId);
+        }
+      });
+    });
+    console.log(`WebSocket notification hub listening on port ${port}`);
+  }
 
-      const explanation: Explanation = {
-        anomalyId,
-        posterior,
-      };
+  private extractTokenFromQuery(url: string): string | null {
+    const match = url.match(/[?&]token=([^&]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
 
-      // Cache result
-      explanationCache.set(anomalyId, explanation);
-      explanations.push(explanation);
-    }
+  public notify(userId: string, message: object): void {
+    const sockets = this.userSockets.get(userId);
+    if (!sockets) return;
+    const payload = JSON.stringify(message);
+    sockets.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      }
+    });
+  }
+}
 
-    return res.json({ explanations });
-  })
-);
+const notificationHub = new NotificationHub(WS_PORT);
 
-// Global error handler
-router.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error.' });
+/**
+ * Middleware: JWT authentication.
+ */
+function authenticateJWT(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authorization header missing or malformed' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { sub: string };
+    (req as any).userId = payload.sub;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid JWT token' });
+  }
+}
+
+/**
+ * Rate limiter: 60 requests per minute per IP.
+ */
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
 });
 
-export default router;
+/**
+ * Helper: Validate request parameters.
+ */
+function validateRequest(req: Request, res: Response, next: NextFunction) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid request parameters', details: errors.array() });
+  }
+  next();
+}
+
+/**
+ * Placeholder: Retrieve time‑series data for a given ID.
+ * In a real implementation this would query a database or external service.
+ */
+async function fetchTimeSeriesData(timeSeriesId: string): Promise<tf.Tensor> {
+  // For demonstration, generate a random tensor with 10 features.
+  // Shape: [1, featureCount]
+  const featureCount = 10;
+  const data = tf.randomNormal([1, featureCount]);
+  return data;
+}
+
+/**
+ * Compute SHAP values using a simple Kernel SHAP approximation.
+ * This is a lightweight implementation for demonstration purposes.
+ *
+ * @param model Trained TensorFlow.js model.
+ * @param input Input tensor of shape [1, features].
+ * @returns Array of feature contributions.
+ */
+async function computeShapValues(model: tf.LayersModel, input: tf.Tensor): Promise<number[]> {
+  // Number of background samples for Kernel SHAP.
+  const backgroundSamples = 50;
+  const featureCount = input.shape[1];
+  const shapValues = new Array<number>(featureCount).fill(0);
+
+  // Generate background data (zeros) as a simple baseline.
+  const baseline = tf.zerosLike(input);
