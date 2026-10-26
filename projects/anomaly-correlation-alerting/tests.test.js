@@ -1,44 +1,82 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateAnomalyCorrelation } from './alertService';
+import {
+  calculateCorrelation,
+  shouldAlert,
+  processAnomalies,
+} from '../alertEngine';
 
-describe('evaluateAnomalyCorrelation', () => {
-  // Normal input – strong positive correlation should trigger an alert
-  it('should trigger an alert when correlation is above the threshold', () => {
-    const seriesA = [1, 2, 3, 4, 5];
-    const seriesB = [2, 4, 6, 8, 10]; // perfect positive correlation (r = 1)
-    const threshold = 0.8;
-    const result = evaluateAnomalyCorrelation(seriesA, seriesB, threshold);
-    expect(result).toEqual({ alert: true, correlation: 1 });
+describe('calculateCorrelation', () => {
+  it('should return a correlation score between 0 and 1 for normal input', () => {
+    const anomalies = [0.2, 0.5, 0.8, 0.6];
+    const score = calculateCorrelation(anomalies);
+    expect(typeof score).toBe('number');
+    expect(score).toBeGreaterThanOrEqual(0);
+    expect(score).toBeLessThanOrEqual(1);
   });
 
-  // Normal input – weak correlation should not trigger an alert
-  it('should not trigger an alert when correlation is below the threshold', () => {
-    const seriesA = [1, 2, 3, 4, 5];
-    const seriesB = [5, 4, 3, 2, 1]; // perfect negative correlation (r = -1)
-    const threshold = 0.5;
-    const result = evaluateAnomalyCorrelation(seriesA, seriesB, threshold);
-    expect(result).toEqual({ alert: false, correlation: -1 });
+  it('should handle an empty array and return 0', () => {
+    const anomalies: number[] = [];
+    const score = calculateCorrelation(anomalies);
+    expect(score).toBe(0);
   });
 
-  // Edge case – empty input arrays
-  it('should handle empty input arrays gracefully', () => {
-    const seriesA: number[] = [];
-    const seriesB: number[] = [];
-    const threshold = 0.5;
-    const result = evaluateAnomalyCorrelation(seriesA, seriesB, threshold);
-    expect(result).toEqual({ alert: false, correlation: 0 });
+  it('should treat zero values correctly', () => {
+    const anomalies = [0, 0, 0];
+    const score = calculateCorrelation(anomalies);
+    expect(score).toBe(0);
   });
 
-  // Edge case – arrays containing only zeros
-  it('should return zero correlation for arrays of all zeros', () => {
-    const seriesA = [0, 0, 0, 0];
-    const seriesB = [0, 0, 0, 0];
-    const threshold = 0.1;
-    const result = evaluateAnomalyCorrelation(seriesA, seriesB, threshold);
-    expect(result).toEqual({ alert: false, correlation: 0 });
+  it('should return 0 for null input (gracefully)', () => {
+    // @ts-ignore – intentionally passing null to test robustness
+    const score = calculateCorrelation(null);
+    expect(score).toBe(0);
   });
 
-  // Edge case – null inputs
-  it('should throw a TypeError when either input is null', () => {
-    const seriesA = null as unknown as number[];
-    const seriesB = [1, 2, 3];
+  it('should handle negative numbers by treating them as zero', () => {
+    const anomalies = [-0.5, -1, -0.2];
+    const score = calculateCorrelation(anomalies);
+    expect(score).toBe(0);
+  });
+
+  it('should correctly compute score at the upper boundary (perfect correlation)', () => {
+    const anomalies = [1, 1, 1, 1];
+    const score = calculateCorrelation(anomalies);
+    expect(score).toBeCloseTo(1);
+  });
+});
+
+describe('shouldAlert', () => {
+  it('should return true when score exceeds threshold', () => {
+    const result = shouldAlert(0.9, 0.8);
+    expect(result).toBe(true);
+  });
+
+  it('should return false when score is below threshold', () => {
+    const result = shouldAlert(0.4, 0.5);
+    expect(result).toBe(false);
+  });
+
+  it('should return false when score equals threshold (non‑strict)', () => {
+    const result = shouldAlert(0.7, 0.7);
+    expect(result).toBe(false);
+  });
+
+  it('should handle zero threshold correctly', () => {
+    const result = shouldAlert(0.1, 0);
+    expect(result).toBe(true);
+  });
+
+  it('should handle negative threshold as always true', () => {
+    const result = shouldAlert(0.2, -0.5);
+    expect(result).toBe(true);
+  });
+
+  it('should handle null inputs gracefully', () => {
+    // @ts-ignore – intentionally passing null
+    const result = shouldAlert(null, null);
+    expect(result).toBe(false);
+  });
+});
+
+describe('processAnomalies', () => {
+  it('should return
