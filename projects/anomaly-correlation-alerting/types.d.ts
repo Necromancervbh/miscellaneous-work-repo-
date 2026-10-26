@@ -1,5 +1,5 @@
 /**
- * Type Definitions for Anomaly Correlation Alerting
+ * Type Definitions for Anomaly Correlation Alerting Service
  */
 export interface ConfigOptions {
   debug?: boolean;
