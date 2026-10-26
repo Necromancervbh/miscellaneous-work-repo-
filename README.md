@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Concept Drift Monitoring Service**](./projects/anomaly-correlation-drift-monitor/) | `Data Science` | Node.js / TypeScript | Detects and alerts on model drift using KL divergence and incremental PCA. |
 | [**Anomaly Correlation Visualization**](./projects/anomaly-correlation-visualization/) | `Data Science` | TypeScript / D3.js | Interactive visual analytics for anomaly correlation insights. |
 | [**Anomaly Correlation Evaluation Service**](./projects/anomaly-correlation-evaluation/) | `Data Science` | Node.js / TypeScript / Python | Evaluates trained models and serves performance metrics. |
 | [**Anomaly Correlation Model Trainer**](./projects/anomaly-correlation-model-trainer/) | `Data Science` | TypeScript/Node.js/Python | Automated training pipeline for Kalman filter and Bayesian models. |
