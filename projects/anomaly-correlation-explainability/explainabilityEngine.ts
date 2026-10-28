@@ -1,158 +1,207 @@
-import * as jwt from 'jsonwebtoken';
-import PCA from 'ml-pca';
-import { promisify } from 'util';
+import * as fs from 'fs';
 
-type ExplainabilityRequest = {
-    token: string;
-    anomalyScore: number;
-    timeSeries: number[][]; // rows: observations, columns: features
-    featureNames?: string[];
-};
+/**
+ * Types defining the structure of input data.
+ */
+export interface CorrelationRecord {
+    /** Source feature name */
+    source: string;
+    /** Target feature name */
+    target: string;
+    /** Correlation coefficient in range [-1, 1] */
+    correlation: number;
+}
 
-type FeatureContribution = {
-    feature: string;
-    contribution: number;
-};
-
-type ExplainabilityResponse = {
-    explanations: FeatureContribution[];
-};
-
-class ValidationError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = 'ValidationError';
-    }
+export interface Evidence {
+    /** Feature name -> observed value (true for anomaly, false otherwise) */
+    [feature: string]: boolean | number;
 }
 
 /**
- * Validates the incoming request payload.
- * Throws ValidationError if any check fails.
+ * Node representation inside the Bayesian network.
  */
-function validateRequest(req: ExplainabilityRequest): void {
-    if (typeof req.token !== 'string' || req.token.trim() === '') {
-        throw new ValidationError('Invalid or missing JWT token.');
+interface BayesNode {
+    /** Feature name */
+    name: string;
+    /** Prior probability P(X) */
+    prior: number;
+    /** Conditional probability table: parentName -> P(X|parent) */
+    cpt: Map<string, number>;
+    /** Parents of this node */
+    parents: Set<string>;
+    /** Children of this node */
+    children: Set<string>;
+    /** Textual description used for TF‑IDF */
+    description: string;
+}
+
+/**
+ * ExplainabilityEngine builds a Bayesian network from correlation data,
+ * computes posterior probabilities given evidence, and produces ranked
+ * textual explanations using TF‑IDF of feature descriptions.
+ */
+export class ExplainabilityEngine {
+    private nodes: Map<string, BayesNode> = new Map();
+    private evidence: Evidence = {};
+
+    /**
+     * Ingest correlation data and optional feature descriptions.
+     * @param correlations Array of CorrelationRecord.
+     * @param descriptions Map of feature name to textual description.
+     * @throws Error if input validation fails.
+     */
+    public ingestCorrelationData(
+        correlations: CorrelationRecord[],
+        descriptions: Map<string, string>
+    ): void {
+        this.validateCorrelations(correlations);
+        this.validateDescriptions(descriptions);
+        this.buildNetwork(correlations, descriptions);
     }
-    if (typeof req.anomalyScore !== 'number' || Number.isNaN(req.anomalyScore)) {
-        throw new ValidationError('Anomaly score must be a valid number.');
-    }
-    if (!Array.isArray(req.timeSeries) || req.timeSeries.length === 0) {
-        throw new ValidationError('timeSeries must be a non‑empty 2‑dimensional array.');
-    }
-    const featureCount = req.timeSeries[0].length;
-    if (featureCount === 0) {
-        throw new ValidationError('timeSeries must contain at least one feature per observation.');
-    }
-    for (let i = 0; i < req.timeSeries.length; i++) {
-        const row = req.timeSeries[i];
-        if (!Array.isArray(row) || row.length !== featureCount) {
-            throw new ValidationError('All rows in timeSeries must have the same number of features.');
+
+    /**
+     * Set observed evidence for a subset of features.
+     * @param ev Evidence object.
+     * @throws Error if evidence contains unknown features.
+     */
+    public setEvidence(ev: Evidence): void {
+        for (const feature of Object.keys(ev)) {
+            if (!this.nodes.has(feature)) {
+                throw new Error(`Evidence contains unknown feature: ${feature}`);
+            }
         }
-        for (let j = 0; j < row.length; j++) {
-            if (typeof row[j] !== 'number' || Number.isNaN(row[j])) {
-                throw new ValidationError(`timeSeries contains non‑numeric value at row ${i}, column ${j}.`);
+        this.evidence = { ...ev };
+    }
+
+    /**
+     * Compute posterior probabilities for all nodes using a simple
+     * belief propagation algorithm (exact for DAGs).
+     * @returns Map of feature name to posterior probability.
+     */
+    public computePosteriors(): Map<string, number> {
+        const order = this.topologicalSort();
+        const posteriors = new Map<string, number>();
+
+        for (const nodeName of order) {
+            const node = this.nodes.get(nodeName)!;
+
+            // Prior probability P(X)
+            let prob = node.prior;
+
+            // Multiply by conditional probabilities given parents' posteriors
+            for (const parentName of node.parents) {
+                const parentPosterior = posteriors.get(parentName);
+                if (parentPosterior === undefined) {
+                    throw new Error(`Parent ${parentName} posterior not computed`);
+                }
+                const condProb = node.cpt.get(parentName);
+                if (condProb === undefined) {
+                    throw new Error(`Missing CPT entry for ${nodeName} given ${parentName}`);
+                }
+                // P(X|parent) = condProb, assume binary variables
+                prob *= condProb * parentPosterior + (1 - condProb) * (1 - parentPosterior);
+            }
+
+            // Incorporate evidence if present (likelihood weighting)
+            if (this.evidence.hasOwnProperty(nodeName)) {
+                const evVal = this.evidence[nodeName];
+                if (typeof evVal === 'boolean') {
+                    prob = evVal ? prob : 1 - prob;
+                } else if (typeof evVal === 'number') {
+                    // Treat numeric evidence as likelihood scaling factor
+                    prob = prob * evVal;
+                }
+            }
+
+            // Clamp probability to [0,1] to avoid numerical issues
+            prob = Math.max(0, Math.min(1, prob));
+            posteriors.set(nodeName, prob);
+        }
+
+        return posteriors;
+    }
+
+    /**
+     * Generate ranked textual explanations based on TF‑IDF scores of
+     * feature descriptions weighted by posterior probabilities.
+     * @returns Array of explanations sorted by descending relevance.
+     */
+    public generateExplanations(): string[] {
+        const posteriors = this.computePosteriors();
+        const docs = Array.from(this.nodes.values()).map(node => node.description);
+        const tfidf = this.computeTfIdf(docs);
+
+        const scores: { node: BayesNode; score: number }[] = [];
+
+        for (const node of this.nodes.values()) {
+            const docIndex = Array.from(this.nodes.keys()).indexOf(node.name);
+            const tfidfVector = tfidf[docIndex];
+            const posterior = posteriors.get(node.name) ?? 0;
+            // Score = posterior * sum(TF‑IDF terms)
+            const tfidfSum = tfidfVector.reduce((a, b) => a + b, 0);
+            const score = posterior * tfidfSum;
+            scores.push({ node, score });
+        }
+
+        scores.sort((a, b) => b.score - a.score);
+        return scores.map(entry => entry.node.description);
+    }
+
+    /**
+     * Validate correlation records.
+     * @param correlations Input array.
+     * @throws Error if validation fails.
+     */
+    private validateCorrelations(correlations: CorrelationRecord[]): void {
+        if (!Array.isArray(correlations)) {
+            throw new Error('Correlations must be an array');
+        }
+        for (const rec of correlations) {
+            if (typeof rec.source !== 'string' || rec.source.trim() === '') {
+                throw new Error('Correlation record missing valid source');
+            }
+            if (typeof rec.target !== 'string' || rec.target.trim() === '') {
+                throw new Error('Correlation record missing valid target');
+            }
+            if (typeof rec.correlation !== 'number' || rec.correlation < -1 || rec.correlation > 1) {
+                throw new Error(`Correlation value for ${rec.source}->${rec.target} out of range [-1,1]`);
             }
         }
     }
-    if (req.featureNames) {
-        if (!Array.isArray(req.featureNames) || req.featureNames.length !== featureCount) {
-            throw new ValidationError('featureNames length must match number of features.');
+
+    /**
+     * Validate feature descriptions.
+     * @param descriptions Map of feature name to description.
+     * @throws Error if any description is missing or empty.
+     */
+    private validateDescriptions(descriptions: Map<string, string>): void {
+        if (!(descriptions instanceof Map)) {
+            throw new Error('Descriptions must be a Map');
         }
-        for (const name of req.featureNames) {
-            if (typeof name !== 'string' || name.trim() === '') {
-                throw new ValidationError('All featureNames must be non‑empty strings.');
+        for (const [feature, desc] of descriptions.entries()) {
+            if (typeof desc !== 'string' || desc.trim() === '') {
+                throw new Error(`Empty description for feature ${feature}`);
             }
         }
     }
-}
 
-/**
- * Verifies the JWT token using the secret from environment variables.
- * Returns the decoded payload if verification succeeds.
- */
-async function verifyToken(token: string): Promise<any> {
-    const secret = process.env.JWT_SECRET;
-    if (!secret) {
-        throw new Error('JWT_SECRET environment variable is not set.');
-    }
-    const verifyAsync = promisify<string, jwt.Secret, jwt.VerifyOptions, any>(jwt.verify);
-    try {
-        const decoded = await verifyAsync(token, secret, { algorithms: ['HS256'] });
-        return decoded;
-    } catch (err) {
-        throw new ValidationError('JWT verification failed.');
-    }
-}
-
-/**
- * Computes SHAP‑like contributions for each original feature.
- *
- * Formula (simplified):
- *   contribution_i = | anomalyScore * Σ_j (loading_{i,j} * projection_j) |
- *
- * where:
- *   loading_{i,j} = component matrix entry (feature i, component j)
- *   projection_j   = transformed value of component j for the current observation
- *
- * The absolute value emphasizes magnitude irrespective of direction.
- */
-function computeFeatureContributions(
-    pca: PCA,
-    projection: number[],
-    anomalyScore: number
-): number[] {
-    const loadings = pca.getLoadings(); // matrix [features][components]
-    const featureCount = loadings.length;
-    const componentCount = loadings[0].length;
-    const contributions: number[] = new Array(featureCount).fill(0);
-
-    for (let i = 0; i < featureCount; i++) {
-        let sum = 0;
-        for (let j = 0; j < componentCount; j++) {
-            sum += loadings[i][j] * projection[j];
+    /**
+     * Build Bayesian network from correlations and descriptions.
+     * Uses a simple heuristic to convert correlation to conditional probability:
+     *   P(child|parent) = (1 + correlation) / 2
+     *   Prior P(node) = 0.5 (uninformative)
+     * @param correlations Correlation data.
+     * @param descriptions Feature descriptions.
+     */
+    private buildNetwork(
+        correlations: CorrelationRecord[],
+        descriptions: Map<string, string>
+    ): void {
+        // Initialize nodes
+        const allFeatures = new Set<string>();
+        for (const rec of correlations) {
+            allFeatures.add(rec.source);
+            allFeatures.add(rec.target);
         }
-        contributions[i] = Math.abs(anomalyScore * sum);
-    }
-    return contributions;
-}
-
-/**
- * Main entry point exposed to callers.
- * Performs JWT validation, PCA reduction, contribution calculation,
- * and returns a JSON‑serializable explanation object.
- */
-export async function explainAnomaly(request: ExplainabilityRequest): Promise<ExplainabilityResponse> {
-    // Input validation
-    validateRequest(request);
-
-    // JWT validation
-    await verifyToken(request.token);
-
-    // PCA configuration
-    const desiredComponents = 3; // can be tuned; ensures at most min(observations, features)
-    const observations = request.timeSeries;
-    const featureCount = observations[0].length;
-    const componentCount = Math.min(desiredComponents, observations.length, featureCount);
-
-    // Perform PCA
-    const pca = new PCA(observations, { center: true, scale: true, nComp: componentCount });
-
-    // Transform the latest observation (assumed to be the last row) into component space
-    const latestObservation = observations[observations.length - 1];
-    const projection = pca.predict([latestObservation])[0]; // returns array of component values
-
-    // Compute feature contributions
-    const rawContributions = computeFeatureContributions(pca, projection, request.anomalyScore);
-
-    // Normalize contributions to sum to 1 for interpretability
-    const total = rawContributions.reduce((acc, val) => acc + val, 0);
-    const normalized = total > 0 ? rawContributions.map(v => v / total) : rawContributions.map(() => 0);
-
-    // Build response
-    const explanations: FeatureContribution[] = normalized.map((contrib, idx) => ({
-        feature: request.featureNames ? request.featureNames[idx] : `feature_${idx}`,
-        contribution: Number(contrib.toFixed(6)) // limit precision for JSON payload
-    }));
-
-    return { explanations };
-}
+        for (const feature of allFeatures) {
+            const desc = descriptions.get(feature) ?? `Feature ${feature
