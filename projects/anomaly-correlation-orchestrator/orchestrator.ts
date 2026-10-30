@@ -1,231 +1,217 @@
-import express, { Request, Response, NextFunction, Router } from 'express';
-import { Server as HttpServer } from 'http';
-import { Server as WebSocketServer, WebSocket } from 'ws';
-import jwt, { JwtPayload } from 'jsonwebtoken';
-import LRUCache from 'lru-cache';
-import { RateLimiterMemory } from 'rate-limiter-flexible';
-import { v4 as uuidv4 } from 'uuid';
-import { predict } from './predictionEngine'; // Assume existing prediction engine
-import { EventPayload, PredictionResult, AlertMessage } from './types';
-
-// Configuration constants
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
-const RATE_LIMIT_POINTS = Number(process.env.RATE_LIMIT_POINTS) || 10; // requests
-const RATE_LIMIT_DURATION = Number(process.env.RATE_LIMIT_DURATION) || 60; // seconds
-const CACHE_MAX_ITEMS = Number(process.env.CACHE_MAX_ITEMS) || 1000;
-const CACHE_MAX_AGE_MS = Number(process.env.CACHE_MAX_AGE_MS) || 5 * 60 * 1000; // 5 minutes
-
-// LRU Cache for prediction results
-// Cache key: `${userId}:${eventId}`
-// Value: PredictionResult
-const predictionCache = new LRUCache<string, PredictionResult>({
-  max: CACHE_MAX_ITEMS,
-  ttl: CACHE_MAX_AGE_MS,
-});
-
-// Rate limiter per user (in-memory)
-const rateLimiter = new RateLimiterMemory({
-  points: RATE_LIMIT_POINTS,
-  duration: RATE_LIMIT_DURATION,
-});
-
-// WebSocket client registry per user
-type ClientRegistry = Map<string, Set<WebSocket>>; // userId -> Set of sockets
-const wsClients: ClientRegistry = new Map();
+import { EventEmitter } from 'events';
+import Redis from 'ioredis';
+import WebSocket, { Server as WebSocketServer } from 'ws';
+import { DBSCAN } from 'ml-dbscan';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
 
 /**
- * Middleware to validate JWT and attach userId to request.
+ * Interface representing the prediction engine.
+ * It must provide forecast residuals for a given time window.
  */
-function jwtAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Missing or malformed Authorization header' });
-    return;
-  }
+export interface PredictionEngine {
+  /**
+   * Retrieves forecast residuals.
+   * @param start ISO string start time.
+   * @param end   ISO string end time.
+   * @returns Promise resolving to an array of residual objects.
+   */
+  getForecastResiduals(start: string, end: string): Promise<Residual[]>;
+}
 
-  const token = authHeader.slice(7);
-  try {
-    const payload = jwt.verify(token, JWT_SECRET) as JwtPayload;
-    if (!payload.sub) {
-      throw new Error('JWT payload missing subject');
+/**
+ * Residual data point.
+ */
+export interface Residual {
+  /** Timestamp of the residual in ISO format. */
+  timestamp: string;
+  /** Numeric residual value (observed - forecast). */
+  value: number;
+}
+
+/**
+ * Cluster result emitted to the dashboard.
+ */
+export interface ClusterResult {
+  /** Unique identifier for the clustering run. */
+  runId: string;
+  /** Timestamp of the clustering run. */
+  runAt: string;
+  /** Array of clusters, each cluster is an array of residual indices. */
+  clusters: number[][];
+  /** Noise points indices (points not belonging to any cluster). */
+  noise: number[];
+}
+
+/**
+ * Orchestrator service that:
+ * 1. Consumes the prediction engine.
+ * 2. Runs DBSCAN clustering on residuals.
+ * 3. Caches results in Redis with LRU eviction.
+ * 4. Broadcasts results via WebSocket.
+ */
+export class AnomalyOrchestrator extends EventEmitter {
+  private readonly redis: Redis.Redis;
+  private readonly wsServer: WebSocketServer;
+  private readonly predictionEngine: PredictionEngine;
+  private readonly cacheTTLSeconds: number;
+  private readonly dbscanEpsilon: number;
+  private readonly dbscanMinPts: number;
+
+  /**
+   * @param predictionEngine Instance implementing PredictionEngine.
+   * @param redisOptions Options for Redis connection.
+   * @param wsPort Port on which the WebSocket server will listen.
+   * @param options Optional configuration.
+   */
+  constructor(
+    predictionEngine: PredictionEngine,
+    redisOptions: Redis.RedisOptions,
+    wsPort: number,
+    options?: {
+      cacheTTLSeconds?: number;
+      dbscanEpsilon?: number;
+      dbscanMinPts?: number;
     }
-    // Attach user identifier to request for downstream use
-    (req as any).userId = payload.sub;
-    next();
-  } catch (err) {
-    res.status(401).json({ error: 'Invalid token', details: (err as Error).message });
-  }
-}
+  ) {
+    super();
 
-/**
- * Middleware to enforce per‑user rate limiting.
- */
-async function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const userId = (req as any).userId as string;
-  try {
-    await rateLimiter.consume(userId);
-    next();
-  } catch (rej) {
-    res.status(429).json({ error: 'Rate limit exceeded' });
-  }
-}
-
-/**
- * Validate incoming event payload.
- * Throws an Error if validation fails.
- */
-function validateEventPayload(body: any): asserts body is EventPayload {
-  if (typeof body !== 'object' || body === null) {
-    throw new Error('Payload must be a JSON object');
-  }
-  if (typeof body.eventId !== 'string' || body.eventId.trim() === '') {
-    throw new Error('eventId must be a non‑empty string');
-  }
-  if (typeof body.timestamp !== 'string' || isNaN(Date.parse(body.timestamp))) {
-    throw new Error('timestamp must be a valid ISO 8601 string');
-  }
-  if (typeof body.data !== 'object' || body.data === null) {
-    throw new Error('data must be an object');
-  }
-}
-
-/**
- * Core handler for ingestion events.
- */
-async function handleIngestion(req: Request, res: Response): Promise<void> {
-  const userId = (req as any).userId as string;
-  try {
-    validateEventPayload(req.body);
-  } catch (validationError) {
-    res.status(400).json({ error: (validationError as Error).message });
-    return;
-  }
-
-  const event: EventPayload = req.body;
-  const cacheKey = `${userId}:${event.eventId}`;
-
-  // Return cached prediction if present
-  const cached = predictionCache.get(cacheKey);
-  if (cached) {
-    res.json({ prediction: cached, cached: true });
-    return;
-  }
-
-  // Trigger prediction engine
-  let prediction: PredictionResult;
-  try {
-    prediction = await predict(event);
-  } catch (engineError) {
-    res.status(502).json({ error: 'Prediction engine failure', details: (engineError as Error).message });
-    return;
-  }
-
-  // Store in cache
-  predictionCache.set(cacheKey, prediction);
-
-  // Publish alert if anomaly detected (example condition)
-  if (prediction.anomalyScore !== undefined && prediction.anomalyScore > 0.8) {
-    const alert: AlertMessage = {
-      alertId: uuidv4(),
-      userId,
-      eventId: event.eventId,
-      timestamp: new Date().toISOString(),
-      severity: 'high',
-      message: `Anomaly detected with score ${prediction.anomalyScore}`,
-      payload: event,
-    };
-    broadcastAlert(userId, alert);
-  }
-
-  res.json({ prediction, cached: false });
-}
-
-/**
- * Broadcast an alert to all WebSocket clients belonging to a user.
- */
-function broadcastAlert(userId: string, alert: AlertMessage): void {
-  const clients = wsClients.get(userId);
-  if (!clients) return;
-
-  const payload = JSON.stringify({ type: 'alert', data: alert });
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(payload);
+    if (!predictionEngine) {
+      throw new Error('PredictionEngine instance is required.');
     }
+    this.predictionEngine = predictionEngine;
+
+    this.redis = new Redis(redisOptions);
+    this.wsServer = new WebSocketServer({ port: wsPort });
+
+    this.cacheTTLSeconds = options?.cacheTTLSeconds ?? 300; // default 5 minutes
+    this.dbscanEpsilon = options?.dbscanEpsilon ?? 0.5; // default epsilon
+    this.dbscanMinPts = options?.dbscanMinPts ?? 5; // default min points
+
+    this.wsServer.on('connection', (socket) => {
+      socket.on('error', (err) => this.emit('error', err));
+    });
+
+    this.wsServer.on('error', (err) => this.emit('error', err));
   }
-}
 
-/**
- * Initialize WebSocket server and attach connection handling.
- */
-function initWebSocket(server: HttpServer): void {
-  const wss = new WebSocketServer({ server, path: '/ws' });
-
-  wss.on('connection', (ws: WebSocket, req) => {
-    // Expect JWT token as query param: ?token=...
-    const url = new URL(req.url ?? '', `http://${req.headers.host}`);
-    const token = url.searchParams.get('token');
-    if (!token) {
-      ws.close(4001, 'Missing token');
-      return;
-    }
-
-    let payload: JwtPayload;
+  /**
+   * Executes the full pipeline for a given time window.
+   * @param start ISO string start time.
+   * @param end   ISO string end time.
+   */
+  public async run(start: string, end: string): Promise<void> {
     try {
-      payload = jwt.verify(token, JWT_SECRET) as JwtPayload;
-      if (!payload.sub) throw new Error('Missing subject');
+      this.validateISODate(start, 'start');
+      this.validateISODate(end, 'end');
+
+      const residuals = await this.predictionEngine.getForecastResiduals(start, end);
+      if (!Array.isArray(residuals) || residuals.length === 0) {
+        throw new Error('Prediction engine returned no residuals.');
+      }
+
+      const points = residuals.map((r) => [r.value]); // DBSCAN expects an array of numeric vectors
+
+      // DBSCAN clustering
+      // Distance metric: Euclidean distance d(p,q) = sqrt( Σ_i (p_i - q_i)^2 )
+      const dbscan = new DBSCAN();
+      const clusters = dbscan.run(points, this.dbscanEpsilon, this.dbscanMinPts);
+      const noise = dbscan.noise;
+
+      const runId = this.generateRunId();
+      const result: ClusterResult = {
+        runId,
+        runAt: new Date().toISOString(),
+        clusters,
+        noise,
+      };
+
+      await this.cacheResult(runId, result);
+      this.broadcastResult(result);
     } catch (err) {
-      ws.close(4002, 'Invalid token');
-      return;
+      this.emit('error', err);
+      throw err;
     }
+  }
 
-    const userId = payload.sub as string;
-    // Register client
-    if (!wsClients.has(userId)) {
-      wsClients.set(userId, new Set());
+  /**
+   * Retrieves a cached clustering result by runId.
+   * @param runId Identifier of the clustering run.
+   * @returns ClusterResult or null if not found.
+   */
+  public async getCachedResult(runId: string): Promise<ClusterResult | null> {
+    if (!runId || typeof runId !== 'string') {
+      throw new Error('Invalid runId.');
     }
-    wsClients.get(userId)!.add(ws);
+    const raw = await this.redis.get(this.cacheKey(runId));
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as ClusterResult;
+    } catch {
+      // Corrupted cache entry; delete it.
+      await this.redis.del(this.cacheKey(runId));
+      return null;
+    }
+  }
 
-    ws.on('close', () => {
-      wsClients.get(userId)!.delete(ws);
-      if (wsClients.get(userId)!.size === 0) {
-        wsClients.delete(userId);
+  /**
+   * Gracefully shuts down connections.
+   */
+  public async shutdown(): Promise<void> {
+    await this.redis.quit();
+    this.wsServer.close();
+  }
+
+  /**
+   * Broadcasts a clustering result to all connected WebSocket clients.
+   * @param result ClusterResult to broadcast.
+   */
+  private broadcastResult(result: ClusterResult): void {
+    const payload = JSON.stringify({ type: 'clusterResult', data: result });
+    this.wsServer.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload, (err) => {
+          if (err) this.emit('error', err);
+        });
       }
     });
+  }
 
-    ws.on('error', () => {
-      ws.close();
-    });
-  });
-}
+  /**
+   * Caches the clustering result in Redis.
+   * @param runId Identifier for the run.
+   * @param result Result to cache.
+   */
+  private async cacheResult(runId: string, result: ClusterResult): Promise<void> {
+    const key = this.cacheKey(runId);
+    const value = JSON.stringify(result);
+    // Using SET with EX to enforce TTL; Redis LRU policy should be configured server-side.
+    await this.redis.set(key, value, 'EX', this.cacheTTLSeconds);
+  }
 
-/**
- * Create and configure the Express router for ingestion endpoint.
- */
-function createRouter(): Router {
-  const router = Router();
+  /**
+   * Generates a deterministic cache key for a given runId.
+   */
+  private cacheKey(runId: string): string {
+    return `clusterResult:${runId}`;
+  }
 
-  router.use(express.json({ limit: '1mb' }));
-  router.use(jwtAuthMiddleware);
-  router.use(rateLimitMiddleware);
-  router.post('/ingest', handleIngestion);
+  /**
+   * Generates a unique identifier for each clustering run.
+   */
+  private generateRunId(): string {
+    // Simple UUID v4 implementation without external deps
+    const bytes = cryptoRandomBytes(16);
+    // Set version to 4
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    // Set variant to RFC4122
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = bytes.toString('hex');
+    return `${hex.substr(0, 8)}-${hex.substr(8, 4)}-${hex.substr(12, 4)}-${hex.substr(16, 4)}-${hex.substr(20, 12)}`;
+  }
 
-  // Health check endpoint (no auth)
-  router.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
-
-  return router;
-}
-
-/**
- * Orchestrator initialization function.
- * Call this from your main server bootstrap file.
- *
- * @param app Express application instance.
- * @param httpServer Underlying HTTP server (required for WebSocket upgrade).
- */
-export function initOrchestrator(app: express.Application, httpServer: HttpServer): void {
-  // Attach router
-  const router = createRouter();
-  app.use('/api
+  /**
+   * Validates that a string is a proper ISO 8601 date.
+   */
+  private validateISODate(dateStr: string, name: string): void {
+    if (typeof dateStr
