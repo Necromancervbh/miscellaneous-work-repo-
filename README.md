@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Prediction Engine**](./projects/anomaly-correlation-prediction/) | `Data Science` | TypeScript / Node.js / TensorFlow.js | Real-time forecasting of anomaly scores using Kalman Filters. |
 | [**Anomaly Correlation Insights Dashboard**](./projects/anomaly-correlation-insights/) | `Full-Stack` | TypeScript, React, Node.js, D3 | Interactive UI for visualizing, querying, and explaining anomaly correlations. |
 | [**Anomaly Correlation Knowledge Base**](./projects/anomaly-correlation-knowledge-base/) | `Data Science` | Node.js / TypeScript / GraphQL | Unified API for querying anomalies, explanations, and visualizations across services. |
 | [**Concept Drift Monitoring Service**](./projects/anomaly-correlation-drift-monitor/) | `Data Science` | Node.js / TypeScript | Detects and alerts on model drift using KL divergence and incremental PCA. |
