@@ -1,193 +1,249 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, {
+  useEffect,
+  useState,
+  useRef,
+  useCallback,
+  ChangeEvent,
+  FC,
+} from "react";
 import * as d3 from "d3";
-import DBSCAN from "density-clustering"; // npm install density-clustering
-// Ensure TypeScript knows the module
-declare module "density-clustering" {
-  export default class DBSCAN {
-    constructor();
-    run(
-      data: number[][],
-      eps: number,
-      minPts: number
-    ): number[][]; // returns array of clusters (each cluster is array of point indices)
-    noise: number[]; // indices of noise points
+import { SimulationNodeDatum, SimulationLinkDatum } from "d3-force";
+
+/**
+ * Types representing the graph structure.
+ */
+interface GraphNode extends SimulationNodeDatum {
+  id: string;
+  cluster: string;
+  /** Optional display label */
+  label?: string;
+  /** Optional size (radius) */
+  size?: number;
+}
+
+interface GraphLink extends SimulationLinkDatum<GraphNode> {
+  source: string | GraphNode;
+  target: string | GraphNode;
+}
+
+/**
+ * Props for the Dashboard component.
+ * In a larger app these could be extended, but for now none are required.
+ */
+interface DashboardProps {}
+
+/**
+ * Helper to safely parse JSON from WebSocket messages.
+ */
+function safeParse<T>(data: string): T | null {
+  try {
+    return JSON.parse(data) as T;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Simple Kalman filter for a single scalar series.
- * Equations:
- *   Predict:   x̂ₖ|ₖ₋₁ = x̂ₖ₋₁|ₖ₋₁
- *   Predict:   Pₖ|ₖ₋₁ = Pₖ₋₁|ₖ₋₁ + Q
- *   Update:    Kₖ = Pₖ|ₖ₋₁ / (Pₖ|ₖ₋₁ + R)
- *   Update:    x̂ₖ|ₖ = x̂ₖ|ₖ₋₁ + Kₖ (zₖ - x̂ₖ|ₖ₋₁)
- *   Update:    Pₖ|ₖ = (1 - Kₖ) Pₖ|ₖ₋₁
+ * Main Dashboard component.
+ * - Fetches initial graph data via JWT‑protected REST endpoint.
+ * - Renders a D3 force‑layout inside an SVG.
+ * - Provides a cluster filter UI.
+ * - Listens for real‑time updates via WebSocket.
  */
-class KalmanScalar {
-  private estimate: number;
-  private errorCovariance: number;
-  private readonly processNoise: number;
-  private readonly measurementNoise: number;
-
-  constructor(initialValue: number, processNoise = 1e-3, measurementNoise = 1e-1) {
-    this.estimate = initialValue;
-    this.errorCovariance = 1;
-    this.processNoise = processNoise;
-    this.measurementNoise = measurementNoise;
-  }
-
-  update(measurement: number): number {
-    // Predict step (no control input)
-    const predEstimate = this.estimate;
-    const predErrorCov = this.errorCovariance + this.processNoise;
-
-    // Update step
-    const kalmanGain = predErrorCov / (predErrorCov + this.measurementNoise);
-    this.estimate = predEstimate + kalmanGain * (measurement - predEstimate);
-    this.errorCovariance = (1 - kalmanGain) * predErrorCov;
-
-    return this.estimate;
-  }
-}
-
-/**
- * Interface for incoming WebSocket messages.
- */
-interface AnomalyMessage {
-  timestamp: number; // Unix epoch ms
-  vector: number[];
-}
-
-/**
- * Processed point after Kalman filtering.
- */
-interface ProcessedPoint {
-  timestamp: number;
-  vector: number[];
-  clusterId: number | null; // null for noise/unclustered
-}
-
-/**
- * Props for Dashboard component.
- */
-interface DashboardProps {
-  /** WebSocket URL (e.g., wss://api.example.com/anomalies) */
-  wsUrl: string;
-  /** Number of recent points to keep for clustering (window size) */
-  clusteringWindow?: number;
-  /** DBSCAN epsilon parameter (distance threshold) */
-  dbscanEps?: number;
-  /** DBSCAN minimum points per cluster */
-  dbscanMinPts?: number;
-}
-
-/**
- * React component that visualizes real‑time anomaly vectors.
- */
-export default function Dashboard({
-  wsUrl,
-  clusteringWindow = 300,
-  dbscanEps = 5,
-  dbscanMinPts = 3,
-}: DashboardProps): JSX.Element {
-  const svgRef = useRef<SVGSVGElement>(null);
-  const [points, setPoints] = useState<ProcessedPoint[]>([]);
-  const kalmanFiltersRef = useRef<KalmanScalar[] | null>(null);
+const Dashboard: FC<DashboardProps> = () => {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const simulationRef = useRef<d3.Simulation<GraphNode, GraphLink> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Initialize WebSocket connection
+  const [token, setToken] = useState<string>("");
+  const [graph, setGraph] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>(
+    { nodes: [], links: [] }
+  );
+  const [clusters, setClusters] = useState<Set<string>>(new Set());
+  const [selectedCluster, setSelectedCluster] = useState<string>("");
+
+  /**
+   * Load JWT token from localStorage (or any other secure store).
+   */
   useEffect(() => {
-    try {
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+    const stored = localStorage.getItem("jwt_token");
+    if (stored && typeof stored === "string") {
+      setToken(stored);
+    } else {
+      console.error("JWT token not found in localStorage");
+    }
+  }, []);
 
-      ws.onopen = () => {
-        console.info("WebSocket connection opened.");
-      };
+  /**
+   * Fetch initial graph data.
+   */
+  useEffect(() => {
+    if (!token) return;
 
-      ws.onmessage = (event) => {
-        try {
-          const data: unknown = JSON.parse(event.data);
-          if (
-            typeof data === "object" &&
-            data !== null &&
-            "timestamp" in data &&
-            "vector" in data &&
-            typeof (data as any).timestamp === "number" &&
-            Array.isArray((data as any).vector) &&
-            (data as any).vector.every((v: any) => typeof v === "number")
-          ) {
-            const msg = data as AnomalyMessage;
-            handleIncomingMessage(msg);
-          } else {
-            console.warn("Invalid message format:", event.data);
-          }
-        } catch (e) {
-          console.error("Failed to parse WebSocket message:", e);
+    const controller = new AbortController();
+    const fetchGraph = async () => {
+      try {
+        const response = await fetch("/api/graph", {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} - ${response.statusText}`);
         }
-      };
 
-      ws.onerror = (ev) => {
-        console.error("WebSocket error:", ev);
-      };
+        const data = (await response.json()) as {
+          nodes: GraphNode[];
+          links: GraphLink[];
+        };
 
-      ws.onclose = (ev) => {
-        console.info(`WebSocket closed (code=${ev.code}).`);
-      };
+        // Basic validation
+        if (!Array.isArray(data.nodes) || !Array.isArray(data.links)) {
+          throw new Error("Invalid graph payload structure");
+        }
 
-      return () => {
-        ws.close();
-      };
-    } catch (e) {
-      console.error("Failed to create WebSocket:", e);
-    }
-  }, [wsUrl]);
+        // Populate clusters set
+        const clusterSet = new Set<string>();
+        data.nodes.forEach((n) => {
+          if (typeof n.cluster === "string") {
+            clusterSet.add(n.cluster);
+          }
+        });
 
-  // Process incoming anomaly message
-  const handleIncomingMessage = (msg: AnomalyMessage) => {
-    // Initialize Kalman filters on first message
-    if (!kalmanFiltersRef.current) {
-      kalmanFiltersRef.current = msg.vector.map(
-        (v) => new KalmanScalar(v)
-      );
-    }
-
-    const filters = kalmanFiltersRef.current!;
-    if (filters.length !== msg.vector.length) {
-      console.error(
-        `Dimension mismatch: expected ${filters.length}, got ${msg.vector.length}`
-      );
-      return;
-    }
-
-    // Apply Kalman filter per dimension
-    const filteredVector = msg.vector.map((value, idx) =>
-      filters[idx].update(value)
-    );
-
-    // Append to points state (maintain window size)
-    setPoints((prev) => {
-      const newPoints = [
-        ...prev,
-        { timestamp: msg.timestamp, vector: filteredVector, clusterId: null },
-      ];
-      if (newPoints.length > clusteringWindow) {
-        newPoints.splice(0, newPoints.length - clusteringWindow);
+        setClusters(clusterSet);
+        setGraph(data);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          // ignore abort errors
+        } else {
+          console.error("Failed to fetch graph data:", err);
+        }
       }
-      // Re‑run clustering on the updated window
-      const clustered = runClustering(newPoints);
-      return clustered;
-    });
-  };
+    };
 
-  // Run DBSCAN clustering on the latest points
-  const runClustering = (data: ProcessedPoint[]): ProcessedPoint[] => {
-    if (data.length === 0) return data;
+    fetchGraph();
 
-    const vectors = data.map((p) => p.vector);
-    const dbscan = new DBSCAN();
-    const clusters = dbscan.run(vectors, dbscanEps, dbscanMinPts);
-    const noise = dbscan.noise;
+    return () => controller.abort();
+  }, [token]);
 
-    // Assign cluster IDs (0‑based). Noise gets null.
-    const clusterMap = new Map<number
+  /**
+   * Set up WebSocket for real‑time updates.
+   */
+  useEffect(() => {
+    if (!token) return;
+
+    const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${
+      window.location.host
+    }/ws/graph?token=${encodeURIComponent(token)}`;
+
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.info("WebSocket connection opened");
+    };
+
+    ws.onmessage = (event) => {
+      const payload = safeParse<{
+        type: "addNode" | "addLink" | "removeNode" | "removeLink";
+        data: any;
+      }>(event.data);
+      if (!payload) {
+        console.warn("Received malformed WebSocket message");
+        return;
+      }
+
+      setGraph((prev) => {
+        const nodes = [...prev.nodes];
+        const links = [...prev.links];
+        switch (payload.type) {
+          case "addNode": {
+            const node: GraphNode = payload.data;
+            if (!node.id) break;
+            if (!nodes.find((n) => n.id === node.id)) {
+              nodes.push(node);
+              if (typeof node.cluster === "string") {
+                setClusters((prevSet) => new Set(prevSet).add(node.cluster));
+              }
+            }
+            break;
+          }
+          case "addLink": {
+            const link: GraphLink = payload.data;
+            if (!link.source || !link.target) break;
+            // Avoid duplicate links
+            if (
+              !links.find(
+                (l) =>
+                  (l.source === link.source || (l.source as GraphNode).id === (link.source as GraphNode).id) &&
+                  (l.target === link.target || (l.target as GraphNode).id === (link.target as GraphNode).id)
+              )
+            ) {
+              links.push(link);
+            }
+            break;
+          }
+          case "removeNode": {
+            const nodeId: string = payload.data.id;
+            const idx = nodes.findIndex((n) => n.id === nodeId);
+            if (idx !== -1) {
+              nodes.splice(idx, 1);
+              // Remove associated links
+              for (let i = links.length - 1; i >= 0; i--) {
+                const l = links[i];
+                const srcId = typeof l.source === "string" ? l.source : l.source.id;
+                const tgtId = typeof l.target === "string" ? l.target : l.target.id;
+                if (srcId === nodeId || tgtId === nodeId) {
+                  links.splice(i, 1);
+                }
+              }
+            }
+            break;
+          }
+          case "removeLink": {
+            const { source, target } = payload.data;
+            const idx = links.findIndex(
+              (l) =>
+                (l.source === source || (l.source as GraphNode).id === source) &&
+                (l.target === target || (l.target as GraphNode).id === target)
+            );
+            if (idx !== -1) {
+              links.splice(idx, 1);
+            }
+            break;
+          }
+          default:
+            console.warn("Unhandled WebSocket message type:", payload.type);
+        }
+        return { nodes, links };
+      });
+    };
+
+    ws.onerror = (ev) => {
+      console.error("WebSocket error:", ev);
+    };
+
+    ws.onclose = (ev) => {
+      console.info(`WebSocket closed (code=${ev.code})`);
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [token]);
+
+  /**
+   * D3 rendering logic.
+   */
+  const renderGraph = useCallback(() => {
+    const svg = d3.select(svgRef.current);
+    if (!svg.node()) return;
+
+    // Clear previous contents
+    svg.selectAll("*").remove();
+
+    const
