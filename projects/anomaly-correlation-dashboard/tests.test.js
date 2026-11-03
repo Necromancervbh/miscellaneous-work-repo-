@@ -1,60 +1,66 @@
 import { describe, it, expect } from 'vitest';
-import {
-  calculateAnomalyCorrelation,
-  generateDashboardMetrics,
-  normalizeData,
-} from './dashboardServer';
+import React from 'react';
+import { render, screen, cleanup } from '@testing-library/react';
+import '@testing-library/jest-dom';
+import { AnomalyCorrelationDashboard } from './dashboard';
 
-describe('calculateAnomalyCorrelation', () => {
-  it('should return 1 for perfectly increasing linear data', () => {
-    const data = [1, 2, 3, 4, 5];
-    const result = calculateAnomalyCorrelation(data);
-    expect(result).toBeCloseTo(1, 5);
+describe('AnomalyCorrelationDashboard', () => {
+  afterEach(() => {
+    cleanup();
   });
 
-  it('should return -1 for perfectly decreasing linear data', () => {
-    const data = [5, 4, 3, 2, 1];
-    const result = calculateAnomalyCorrelation(data);
-    expect(result).toBeCloseTo(-1, 5);
+  // Normal input
+  it('renders correctly with typical data set', () => {
+    const data = [0.1, 0.5, 0.9, 0.3, 0.7];
+    render(<AnomalyCorrelationDashboard data={data} />);
+    // Assuming the component displays a title
+    expect(screen.getByText(/anomaly correlation/i)).toBeInTheDocument();
+    // Assuming it renders a chart container
+    expect(screen.getByTestId('correlation-chart')).toBeInTheDocument();
+    // Verify that the number of data points rendered matches input length
+    const points = screen.getAllByTestId('chart-point');
+    expect(points).toHaveLength(data.length);
   });
 
-  it('should handle mixed positive and negative numbers correctly', () => {
-    const data = [-2, -1, 0, 1, 2];
-    const result = calculateAnomalyCorrelation(data);
-    expect(result).toBeCloseTo(1, 5);
+  // Edge case: empty array
+  it('handles empty data array gracefully', () => {
+    const data: number[] = [];
+    render(<AnomalyCorrelationDashboard data={data} />);
+    expect(screen.getByText(/no data available/i)).toBeInTheDocument();
+    // Chart should not be rendered
+    expect(screen.queryByTestId('correlation-chart')).not.toBeInTheDocument();
   });
 
-  it('should return 0 for uncorrelated data', () => {
-    const data = [1, -1, 1, -1, 1];
-    const result = calculateAnomalyCorrelation(data);
-    expect(result).toBeCloseTo(0, 5);
+  // Edge case: zero values
+  it('renders correctly when data contains zeros', () => {
+    const data = [0, 0, 0, 0];
+    render(<AnomalyCorrelationDashboard data={data} />);
+    const points = screen.getAllByTestId('chart-point');
+    expect(points).toHaveLength(data.length);
+    // All points should be positioned at the baseline (e.g., y=0)
+    points.forEach((point) => {
+      expect(point).toHaveAttribute('data-y', '0');
+    });
   });
 
-  it('should return NaN for an array of identical values', () => {
-    const data = [3, 3, 3, 3, 3];
-    const result = calculateAnomalyCorrelation(data);
-    expect(Number.isNaN(result)).toBe(true);
+  // Edge case: null data prop
+  it('displays error message when data prop is null', () => {
+    // @ts-ignore – intentionally passing null to test robustness
+    render(<AnomalyCorrelationDashboard data={null} />);
+    expect(screen.getByText(/invalid data/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('correlation-chart')).not.toBeInTheDocument();
   });
 
-  it('should throw TypeError when input is null', () => {
-    // @ts-expect-error testing runtime behavior
-    expect(() => calculateAnomalyCorrelation(null)).toThrow(TypeError);
+  // Edge case: negative numbers
+  it('handles negative values correctly', () => {
+    const data = [-0.8, -0.3, -0.5];
+    render(<AnomalyCorrelationDashboard data={data} />);
+    const points = screen.getAllByTestId('chart-point');
+    expect(points).toHaveLength(data.length);
+    // Verify that points are rendered below the baseline (e.g., y < 0)
+    points.forEach((point, idx) => {
+      const yValue = parseFloat(point.getAttribute('data-y') ?? '0');
+      expect(yValue).toBeLessThan(0);
+      expect(yValue).toBeCloseTo(data[idx], 5);
+    });
   });
-
-  it('should throw TypeError when input is undefined', () => {
-    // @ts-expect-error testing runtime behavior
-    expect(() => calculateAnomalyCorrelation(undefined)).toThrow(TypeError);
-  });
-
-  it('should handle empty array by returning NaN', () => {
-    const result = calculateAnomalyCorrelation([]);
-    expect(Number.isNaN(result)).toBe(true);
-  });
-
-  it('should handle array with a single element by returning NaN', () => {
-    const result = calculateAnomalyCorrelation([42]);
-    expect(Number.isNaN(result)).toBe(true);
-  });
-
-  it('should correctly process large dataset (boundary condition)', () => {
-    const data = Array.from({ length: 1000 }, (_, i) => i);
