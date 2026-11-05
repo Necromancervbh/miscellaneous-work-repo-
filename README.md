@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Ensemble Engine**](./projects/anomaly-correlation-ensemble/) | `Data Science` | Python / FastAPI | Unified API combining analytics, forecasting, and knowledge base. |
 | [**Anomaly Correlation Graph API**](./projects/anomaly-correlation-graph-api/) | `Full-Stack` | Node.js / TypeScript / Express | Secure API for graph clustering and anomaly queries. |
 | [**Graph Explorer for Anomaly Correlations**](./projects/anomaly-correlation-graph-explorer/) | `Data Science` | TypeScript / Node.js | Interactive service mapping anomaly relationships via graph clustering. |
 | [**Anomaly Correlation Prediction Engine**](./projects/anomaly-correlation-prediction/) | `Data Science` | TypeScript / Node.js / TensorFlow.js | Real-time forecasting of anomaly scores using Kalman Filters. |
