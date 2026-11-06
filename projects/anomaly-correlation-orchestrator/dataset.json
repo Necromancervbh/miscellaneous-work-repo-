@@ -1,5 +1,5 @@
 {
-  "projectName": "Anomaly Correlation Orchestration Service",
+  "projectName": "Anomaly Correlation Orchestrator",
   "version": "1.0.0",
   "sampleRecords": [
     { "id": 1, "value": 42.5, "status": "active" },
