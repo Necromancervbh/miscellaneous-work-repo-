@@ -1,146 +1,116 @@
-import React, {
-  useEffect,
-  useState,
-  useRef,
-  useCallback,
-  ChangeEvent,
-  FC,
-} from "react";
-import * as d3 from "d3";
-import { SimulationNodeDatum, SimulationLinkDatum } from "d3-force";
+import React, { useEffect, useState, useRef, useCallback } from "react";
+import axios, { AxiosError } from "axios";
+import {
+  Box,
+  Button,
+  CircularProgress,
+  FormControl,
+  InputLabel,
+  MenuItem,
+  Select,
+  SelectChangeEvent,
+  Snackbar,
+  Alert,
+  Typography,
+} from "@mui/material";
+import { ScatterChart, Scatter, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import KMeans from "ml-kmeans";
 
 /**
- * Types representing the graph structure.
+ * Types
  */
-interface GraphNode extends SimulationNodeDatum {
+interface Anomaly {
   id: string;
-  cluster: string;
-  /** Optional display label */
-  label?: string;
-  /** Optional size (radius) */
-  size?: number;
+  timestamp: string; // ISO string
+  value: number;
+  featureX: number;
+  featureY: number;
+  // Additional fields can be added as needed
 }
 
-interface GraphLink extends SimulationLinkDatum<GraphNode> {
-  source: string | GraphNode;
-  target: string | GraphNode;
-}
-
-/**
- * Props for the Dashboard component.
- * In a larger app these could be extended, but for now none are required.
- */
-interface DashboardProps {}
-
-/**
- * Helper to safely parse JSON from WebSocket messages.
- */
-function safeParse<T>(data: string): T | null {
-  try {
-    return JSON.parse(data) as T;
-  } catch {
-    return null;
-  }
+interface ClusteredAnomaly extends Anomaly {
+  cluster: number;
 }
 
 /**
- * Main Dashboard component.
- * - Fetches initial graph data via JWT‑protected REST endpoint.
- * - Renders a D3 force‑layout inside an SVG.
- * - Provides a cluster filter UI.
- * - Listens for real‑time updates via WebSocket.
+ * Constants
  */
-const Dashboard: FC<DashboardProps> = () => {
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const simulationRef = useRef<d3.Simulation<GraphNode, GraphLink> | null>(null);
+const ORCHESTRATOR_API_URL = "/api/anomalies";
+const ALERT_API_URL = "/api/alerts";
+const WEBSOCKET_URL = (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/anomalies";
+
+/**
+ * Dashboard Component
+ */
+const Dashboard: React.FC = () => {
+  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
+  const [clusteredData, setClusteredData] = useState<ClusteredAnomaly[]>([]);
+  const [k, setK] = useState<number>(3);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [errorMsg, setErrorMsg] = useState<string>("");
+  const [alertMsg, setAlertMsg] = useState<string>("");
   const wsRef = useRef<WebSocket | null>(null);
-
-  const [token, setToken] = useState<string>("");
-  const [graph, setGraph] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>(
-    { nodes: [], links: [] }
-  );
-  const [clusters, setClusters] = useState<Set<string>>(new Set());
-  const [selectedCluster, setSelectedCluster] = useState<string>("");
+  const isMounted = useRef<boolean>(true);
 
   /**
-   * Load JWT token from localStorage (or any other secure store).
+   * Fetch initial anomalies from orchestrator API
    */
-  useEffect(() => {
-    const stored = localStorage.getItem("jwt_token");
-    if (stored && typeof stored === "string") {
-      setToken(stored);
-    } else {
-      console.error("JWT token not found in localStorage");
+  const fetchAnomalies = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await axios.get<Anomaly[]>(ORCHESTRATOR_API_URL);
+      if (Array.isArray(response.data)) {
+        setAnomalies(response.data);
+      } else {
+        throw new Error("Invalid data format received from API");
+      }
+    } catch (error) {
+      const msg = (error as AxiosError).isAxiosError
+        ? `API Error: ${(error as AxiosError).message}`
+        : `Unexpected Error: ${(error as Error).message}`;
+      setErrorMsg(msg);
+    } finally {
+      setLoading(false);
     }
   }, []);
 
   /**
-   * Fetch initial graph data.
+   * Run K-Means clustering on anomalies
+   * Uses featureX and featureY as 2‑dimensional vectors.
+   * Formula: minimize Σ_i Σ_{x∈C_i} ||x - μ_i||²
    */
-  useEffect(() => {
-    if (!token) return;
+  const runClustering = useCallback(() => {
+    if (anomalies.length === 0) {
+      setClusteredData([]);
+      return;
+    }
 
-    const controller = new AbortController();
-    const fetchGraph = async () => {
-      try {
-        const response = await fetch("/api/graph", {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          signal: controller.signal,
-        });
+    const dataMatrix = anomalies.map((a) => [a.featureX, a.featureY]);
 
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status} - ${response.statusText}`);
-        }
+    // Validate k (must be >=1 and <= number of points)
+    const effectiveK = Math.max(1, Math.min(k, anomalies.length));
 
-        const data = (await response.json()) as {
-          nodes: GraphNode[];
-          links: GraphLink[];
-        };
-
-        // Basic validation
-        if (!Array.isArray(data.nodes) || !Array.isArray(data.links)) {
-          throw new Error("Invalid graph payload structure");
-        }
-
-        // Populate clusters set
-        const clusterSet = new Set<string>();
-        data.nodes.forEach((n) => {
-          if (typeof n.cluster === "string") {
-            clusterSet.add(n.cluster);
-          }
-        });
-
-        setClusters(clusterSet);
-        setGraph(data);
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") {
-          // ignore abort errors
-        } else {
-          console.error("Failed to fetch graph data:", err);
-        }
-      }
-    };
-
-    fetchGraph();
-
-    return () => controller.abort();
-  }, [token]);
+    try {
+      const result = KMeans(dataMatrix, effectiveK);
+      const clustered: ClusteredAnomaly[] = anomalies.map((a, idx) => ({
+        ...a,
+        cluster: result.clusters[idx],
+      }));
+      setClusteredData(clustered);
+    } catch (e) {
+      setErrorMsg(`Clustering failed: ${(e as Error).message}`);
+    }
+  }, [anomalies, k]);
 
   /**
-   * Set up WebSocket for real‑time updates.
+   * WebSocket handling for live updates
    */
-  useEffect(() => {
-    if (!token) return;
+  const initWebSocket = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
+    }
 
-    const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${
-      window.location.host
-    }/ws/graph?token=${encodeURIComponent(token)}`;
-
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(WEBSOCKET_URL);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -148,102 +118,121 @@ const Dashboard: FC<DashboardProps> = () => {
     };
 
     ws.onmessage = (event) => {
-      const payload = safeParse<{
-        type: "addNode" | "addLink" | "removeNode" | "removeLink";
-        data: any;
-      }>(event.data);
-      if (!payload) {
-        console.warn("Received malformed WebSocket message");
-        return;
-      }
-
-      setGraph((prev) => {
-        const nodes = [...prev.nodes];
-        const links = [...prev.links];
-        switch (payload.type) {
-          case "addNode": {
-            const node: GraphNode = payload.data;
-            if (!node.id) break;
-            if (!nodes.find((n) => n.id === node.id)) {
-              nodes.push(node);
-              if (typeof node.cluster === "string") {
-                setClusters((prevSet) => new Set(prevSet).add(node.cluster));
-              }
-            }
-            break;
-          }
-          case "addLink": {
-            const link: GraphLink = payload.data;
-            if (!link.source || !link.target) break;
-            // Avoid duplicate links
-            if (
-              !links.find(
-                (l) =>
-                  (l.source === link.source || (l.source as GraphNode).id === (link.source as GraphNode).id) &&
-                  (l.target === link.target || (l.target as GraphNode).id === (link.target as GraphNode).id)
-              )
-            ) {
-              links.push(link);
-            }
-            break;
-          }
-          case "removeNode": {
-            const nodeId: string = payload.data.id;
-            const idx = nodes.findIndex((n) => n.id === nodeId);
-            if (idx !== -1) {
-              nodes.splice(idx, 1);
-              // Remove associated links
-              for (let i = links.length - 1; i >= 0; i--) {
-                const l = links[i];
-                const srcId = typeof l.source === "string" ? l.source : l.source.id;
-                const tgtId = typeof l.target === "string" ? l.target : l.target.id;
-                if (srcId === nodeId || tgtId === nodeId) {
-                  links.splice(i, 1);
-                }
-              }
-            }
-            break;
-          }
-          case "removeLink": {
-            const { source, target } = payload.data;
-            const idx = links.findIndex(
-              (l) =>
-                (l.source === source || (l.source as GraphNode).id === source) &&
-                (l.target === target || (l.target as GraphNode).id === target)
-            );
-            if (idx !== -1) {
-              links.splice(idx, 1);
-            }
-            break;
-          }
-          default:
-            console.warn("Unhandled WebSocket message type:", payload.type);
+      try {
+        const payload: Anomaly = JSON.parse(event.data);
+        // Basic validation
+        if (!payload.id || typeof payload.featureX !== "number" || typeof payload.featureY !== "number") {
+          console.warn("Invalid anomaly payload received via WebSocket");
+          return;
         }
-        return { nodes, links };
-      });
+        setAnomalies((prev) => {
+          const updated = [...prev, payload];
+          // Keep only latest 500 points to avoid memory blow‑up
+          return updated.length > 500 ? updated.slice(updated.length - 500) : updated;
+        });
+      } catch (e) {
+        console.error("Failed to parse WebSocket message:", e);
+      }
     };
 
-    ws.onerror = (ev) => {
-      console.error("WebSocket error:", ev);
+    ws.onerror = (event) => {
+      console.error("WebSocket error:", event);
+      setErrorMsg("WebSocket connection error");
     };
 
-    ws.onclose = (ev) => {
-      console.info(`WebSocket closed (code=${ev.code})`);
+    ws.onclose = (event) => {
+      console.info(`WebSocket closed (code=${event.code})`);
+      // Attempt reconnection after a delay
+      if (isMounted.current) {
+        setTimeout(initWebSocket, 5000);
+      }
     };
-
-    return () => {
-      ws.close();
-    };
-  }, [token]);
+  }, []);
 
   /**
-   * D3 rendering logic.
+   * Trigger alert for a specific anomaly
    */
-  const renderGraph = useCallback(() => {
-    const svg = d3.select(svgRef.current);
-    if (!svg.node()) return;
+  const triggerAlert = async (anomalyId: string) => {
+    try {
+      await axios.post(ALERT_API_URL, { anomalyId });
+      setAlertMsg(`Alert sent for anomaly ${anomalyId}`);
+    } catch (error) {
+      const msg = (error as AxiosError).isAxiosError
+        ? `Alert API error: ${(error as AxiosError).message}`
+        : `Unexpected error: ${(error as Error).message}`;
+      setErrorMsg(msg);
+    }
+  };
 
-    // Clear previous contents
-    svg.selectAll("*").remove();
+  /**
+   * Effect: component mount/unmount
+   */
+  useEffect(() => {
+    isMounted.current = true;
+    fetchAnomalies();
+    initWebSocket();
 
-    const
+    return () => {
+      isMounted.current = false;
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, [fetchAnomalies, initWebSocket]);
+
+  /**
+   * Effect: re‑run clustering when anomalies or k change
+   */
+  useEffect(() => {
+    runClustering();
+  }, [anomalies, k, runClustering]);
+
+  /**
+   * UI Handlers
+   */
+  const handleKChange = (event: SelectChangeEvent<number>) => {
+    const value = Number(event.target.value);
+    if (!Number.isNaN(value) && value > 0) {
+      setK(value);
+    }
+  };
+
+  const handleCloseSnackbar = () => {
+    setErrorMsg("");
+    setAlertMsg("");
+  };
+
+  /**
+   * Render
+   */
+  return (
+    <Box sx={{ p: 4 }}>
+      <Typography variant="h4" gutterBottom>
+        Anomaly Correlation Dashboard
+      </Typography>
+
+      <Box sx={{ display: "flex", alignItems: "center", mb: 2 }}>
+        <FormControl sx={{ minWidth: 120, mr: 2 }}>
+          <InputLabel id="k-select-label">Clusters (k)</InputLabel>
+          <Select
+            labelId="k-select-label"
+            value={k}
+            label="Clusters (k)"
+            onChange={handleKChange as any}
+          >
+            {[2, 3, 4, 5, 6].map((val) => (
+              <MenuItem key={val} value={val}>
+                {val}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+        {loading && <CircularProgress size={24} />}
+      </Box>
+
+      {clusteredData.length > 0 ? (
+        <ResponsiveContainer width="100%" height={500}>
+          <ScatterChart>
+            <XAxis type="number" dataKey="featureX" name="Feature X" />
+            <YAxis type="number" dataKey="featureY" name="Feature Y" />
+            <Tooltip
