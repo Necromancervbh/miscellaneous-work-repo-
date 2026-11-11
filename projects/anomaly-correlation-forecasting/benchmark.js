@@ -1,6 +1,6 @@
 /**
- * Performance Benchmark for Forecasting Engine
+ * Performance Benchmark for Anomaly Correlation Forecasting
  */
-console.time('Forecasting Engine throughput (10,000 iterations)');
+console.time('Anomaly Correlation Forecasting throughput (10,000 iterations)');
 for (let i = 0; i < 10000; i++) { /* benchmark loop */ }
-console.timeEnd('Forecasting Engine throughput (10,000 iterations)');
+console.timeEnd('Anomaly Correlation Forecasting throughput (10,000 iterations)');
