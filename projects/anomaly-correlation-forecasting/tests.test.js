@@ -1,84 +1,66 @@
 import { describe, it, expect } from 'vitest';
-import { forecast } from './forecastService';
+import { calculateAnomalyCorrelation } from '../forecast_service';
 
-describe('forecastService', () => {
-  // Normal input tests
-  it('should return a correct forecast for a typical positive value', () => {
-    const input = 42;
-    const result = forecast(input);
-    // Replace the expected value with the actual business logic expectation
-    // For example, if forecast returns input * 1.1
-    expect(result).toBeCloseTo(46.2, 5);
+// Helper to generate a simple increasing series
+const generateSeries = (length, start = 1, step = 1) => {
+  return Array.from({ length }, (_, i) => start + i * step);
+};
+
+describe('Anomaly Correlation Forecasting', () => {
+  // Normal input test
+  it('should return correct correlation for typical input series', () => {
+    const observed = generateSeries(10, 10, 2); // [10,12,14,...,28]
+    const forecast = generateSeries(10, 11, 2); // [11,13,15,...,29]
+    const result = calculateAnomalyCorrelation(observed, forecast);
+    // For perfectly aligned series with a constant offset, correlation should be 1
+    expect(result).toBeCloseTo(1, 5);
   });
 
-  it('should handle a typical decimal input correctly', () => {
-    const input = 12.5;
-    const result = forecast(input);
-    expect(result).toBeCloseTo(13.75, 5);
+  // Edge case: empty arrays
+  it('should handle empty input arrays gracefully', () => {
+    const observed = [];
+    const forecast = [];
+    const result = calculateAnomalyCorrelation(observed, forecast);
+    // Define expected behavior: return null when no data is available
+    expect(result).toBeNull();
   });
 
-  // Edge case: zero
-  it('should handle zero input gracefully', () => {
-    const input = 0;
-    const result = forecast(input);
-    // Assuming forecast of zero is zero or a defined baseline
-    expect(result).toBe(0);
+  // Edge case: arrays containing zero values
+  it('should correctly compute correlation when series contain zeros', () => {
+    const observed = [0, 0, 0, 0, 0];
+    const forecast = [0, 0, 0, 0, 0];
+    const result = calculateAnomalyCorrelation(observed, forecast);
+    // Zero variance leads to undefined correlation; expect null
+    expect(result).toBeNull();
   });
 
-  // Edge case: null
-  it('should throw or return a default value when input is null', () => {
-    const input = null;
-    // Adjust based on implementation: either expect a throw or a fallback
-    expect(() => forecast(input as any)).toThrow();
-  });
+  // Edge case: null inputs
+  it('should return null when either input is null', () => {
+    const observed = null;
+    const forecast = generateSeries(5);
+    expect(calculateAnomalyCorrelation(observed, forecast)).toBeNull();
 
-  // Edge case: undefined
-  it('should throw or return a default value when input is undefined', () => {
-    const input = undefined;
-    expect(() => forecast(input as any)).toThrow();
+    const observed2 = generateSeries(5);
+    const forecast2 = null;
+    expect(calculateAnomalyCorrelation(observed2, forecast2)).toBeNull();
   });
 
   // Edge case: negative numbers
-  it('should handle negative input according to business rules', () => {
-    const input = -10;
-    const result = forecast(input);
-    // Example expectation: negative values might be treated as zero or produce a negative forecast
-    expect(result).toBeCloseTo(-11, 5);
+  it('should correctly handle negative values in the series', () => {
+    const observed = [-5, -3, -1, 1, 3];
+    const forecast = [-4, -2, 0, 2, 4];
+    const result = calculateAnomalyCorrelation(observed, forecast);
+    // These series are perfectly linearly related, correlation should be 1
+    expect(result).toBeCloseTo(1, 5);
   });
 
-  // Edge case: empty string (invalid type)
-  it('should throw when input is an empty string', () => {
-    const input = '' as any;
-    expect(() => forecast(input)).toThrow();
+  // Boundary condition: mismatched lengths
+  it('should return null when input arrays have different lengths', () => {
+    const observed = generateSeries(5);
+    const forecast = generateSeries(6);
+    const result = calculateAnomalyCorrelation(observed, forecast);
+    expect(result).toBeNull();
   });
 
-  // Boundary condition: maximum safe integer
-  it('should correctly forecast the maximum safe integer', () => {
-    const input = Number.MAX_SAFE_INTEGER;
-    const result = forecast(input);
-    // Assuming linear scaling, adjust expectation accordingly
-    expect(result).toBeCloseTo(Number.MAX_SAFE_INTEGER * 1.1, 0);
-  });
-
-  // Boundary condition: minimum safe integer
-  it('should correctly forecast the minimum safe integer', () => {
-    const input = Number.MIN_SAFE_INTEGER;
-    const result = forecast(input);
-    expect(result).toBeCloseTo(Number.MIN_SAFE_INTEGER * 1.1, 0);
-  });
-
-  // Boundary condition: very large number beyond safe integer
-  it('should handle numbers larger than MAX_SAFE_INTEGER without precision loss', () => {
-    const input = Number.MAX_SAFE_INTEGER + 1;
-    const result = forecast(input);
-    // Expect the function to either clamp, round, or handle big numbers gracefully
-    expect(result).toBeGreaterThan(0);
-  });
-
-  // Boundary condition: very small positive number (close to zero)
-  it('should handle a very small positive number', () => {
-    const input = 1e-12;
-    const result = forecast(input);
-    expect(result).toBeCloseTo(1.1e-12, 15);
-  });
-});
+  // Boundary condition: extreme values (large magnitude)
+  it
