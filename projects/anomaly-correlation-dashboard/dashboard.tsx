@@ -1,238 +1,225 @@
-import React, { useEffect, useState, useRef, useCallback } from "react";
-import axios, { AxiosError } from "axios";
-import {
-  Box,
-  Button,
-  CircularProgress,
-  FormControl,
-  InputLabel,
-  MenuItem,
-  Select,
-  SelectChangeEvent,
-  Snackbar,
-  Alert,
-  Typography,
-} from "@mui/material";
-import { ScatterChart, Scatter, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from "recharts";
-import KMeans from "ml-kmeans";
+import React, {
+  useEffect,
+  useState,
+  useRef,
+  lazy,
+  Suspense,
+  FC,
+  ReactNode,
+} from "react";
+import type { MessageEvent } from "ws";
+import LRUCache from "lru-cache";
 
-/**
- * Types
- */
-interface Anomaly {
-  id: string;
-  timestamp: string; // ISO string
+// Types for incoming data ----------------------------------------------------
+interface KalmanForecast {
+  timestamp: number; // Unix epoch ms
   value: number;
-  featureX: number;
-  featureY: number;
-  // Additional fields can be added as needed
+  lowerBound: number;
+  upperBound: number;
 }
 
-interface ClusteredAnomaly extends Anomaly {
-  cluster: number;
+interface KMeansCluster {
+  timestamp: number;
+  clusterId: number;
+  x: number;
+  y: number;
 }
 
-/**
- * Constants
- */
-const ORCHESTRATOR_API_URL = "/api/anomalies";
-const ALERT_API_URL = "/api/alerts";
-const WEBSOCKET_URL = (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/anomalies";
+interface ShapScore {
+  feature: string;
+  score: number;
+}
 
-/**
- * Dashboard Component
- */
-const Dashboard: React.FC = () => {
-  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
-  const [clusteredData, setClusteredData] = useState<ClusteredAnomaly[]>([]);
-  const [k, setK] = useState<number>(3);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [errorMsg, setErrorMsg] = useState<string>("");
-  const [alertMsg, setAlertMsg] = useState<string>("");
+// WebSocket message payload ---------------------------------------------------
+interface HubMessage {
+  type: "kalman" | "kmeans" | "shap";
+  payload: any;
+}
+
+// Lazy loaded chart components ------------------------------------------------
+const KalmanChart = lazy(() => import("./charts/KalmanChart"));
+const KMeansChart = lazy(() => import("./charts/KMeansChart"));
+const ShapChart = lazy(() => import("./charts/ShapChart"));
+
+// LRU cache configuration ------------------------------------------------------
+const apiCache = new LRUCache<string, any>({
+  max: 100, // maximum 100 entries
+  ttl: 1000 * 60 * 5, // 5 minutes TTL
+});
+
+// Helper to fetch data with caching -------------------------------------------
+async function fetchWithCache<T>(url: string): Promise<T> {
+  const cached = apiCache.get(url);
+  if (cached) {
+    return cached as T;
+  }
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error(`Network response was not ok: ${response.status}`);
+  }
+  const data = (await response.json()) as T;
+  apiCache.set(url, data);
+  return data;
+}
+
+// WebSocket hook ---------------------------------------------------------------
+function useHubWebSocket(
+  url: string,
+  onMessage: (msg: HubMessage) => void,
+): { error: Error | null; readyState: number } {
   const wsRef = useRef<WebSocket | null>(null);
-  const isMounted = useRef<boolean>(true);
+  const [error, setError] = useState<Error | null>(null);
+  const [readyState, setReadyState] = useState<number>(WebSocket.CLOSED);
 
-  /**
-   * Fetch initial anomalies from orchestrator API
-   */
-  const fetchAnomalies = useCallback(async () => {
-    setLoading(true);
-    try {
-      const response = await axios.get<Anomaly[]>(ORCHESTRATOR_API_URL);
-      if (Array.isArray(response.data)) {
-        setAnomalies(response.data);
-      } else {
-        throw new Error("Invalid data format received from API");
-      }
-    } catch (error) {
-      const msg = (error as AxiosError).isAxiosError
-        ? `API Error: ${(error as AxiosError).message}`
-        : `Unexpected Error: ${(error as Error).message}`;
-      setErrorMsg(msg);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  /**
-   * Run K-Means clustering on anomalies
-   * Uses featureX and featureY as 2‑dimensional vectors.
-   * Formula: minimize Σ_i Σ_{x∈C_i} ||x - μ_i||²
-   */
-  const runClustering = useCallback(() => {
-    if (anomalies.length === 0) {
-      setClusteredData([]);
+  useEffect(() => {
+    if (!url) {
+      setError(new Error("WebSocket URL is required"));
       return;
     }
 
-    const dataMatrix = anomalies.map((a) => [a.featureX, a.featureY]);
-
-    // Validate k (must be >=1 and <= number of points)
-    const effectiveK = Math.max(1, Math.min(k, anomalies.length));
-
+    let ws: WebSocket;
     try {
-      const result = KMeans(dataMatrix, effectiveK);
-      const clustered: ClusteredAnomaly[] = anomalies.map((a, idx) => ({
-        ...a,
-        cluster: result.clusters[idx],
-      }));
-      setClusteredData(clustered);
+      ws = new WebSocket(url);
+      wsRef.current = ws;
     } catch (e) {
-      setErrorMsg(`Clustering failed: ${(e as Error).message}`);
-    }
-  }, [anomalies, k]);
-
-  /**
-   * WebSocket handling for live updates
-   */
-  const initWebSocket = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close();
+      setError(e instanceof Error ? e : new Error(String(e)));
+      return;
     }
 
-    const ws = new WebSocket(WEBSOCKET_URL);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      console.info("WebSocket connection opened");
+    const handleOpen = () => setReadyState(ws.readyState);
+    const handleClose = () => setReadyState(ws.readyState);
+    const handleError = (ev: Event) => {
+      setError(new Error(`WebSocket error: ${JSON.stringify(ev)}`));
     };
-
-    ws.onmessage = (event) => {
+    const handleMessage = (event: MessageEvent) => {
       try {
-        const payload: Anomaly = JSON.parse(event.data);
-        // Basic validation
-        if (!payload.id || typeof payload.featureX !== "number" || typeof payload.featureY !== "number") {
-          console.warn("Invalid anomaly payload received via WebSocket");
-          return;
+        const parsed: HubMessage = JSON.parse(event.data);
+        if (!parsed.type || !parsed.payload) {
+          throw new Error("Invalid message format");
         }
-        setAnomalies((prev) => {
-          const updated = [...prev, payload];
-          // Keep only latest 500 points to avoid memory blow‑up
-          return updated.length > 500 ? updated.slice(updated.length - 500) : updated;
-        });
+        onMessage(parsed);
       } catch (e) {
         console.error("Failed to parse WebSocket message:", e);
       }
     };
 
-    ws.onerror = (event) => {
-      console.error("WebSocket error:", event);
-      setErrorMsg("WebSocket connection error");
-    };
+    ws.addEventListener("open", handleOpen);
+    ws.addEventListener("close", handleClose);
+    ws.addEventListener("error", handleError);
+    ws.addEventListener("message", handleMessage);
 
-    ws.onclose = (event) => {
-      console.info(`WebSocket closed (code=${event.code})`);
-      // Attempt reconnection after a delay
-      if (isMounted.current) {
-        setTimeout(initWebSocket, 5000);
-      }
-    };
-  }, []);
-
-  /**
-   * Trigger alert for a specific anomaly
-   */
-  const triggerAlert = async (anomalyId: string) => {
-    try {
-      await axios.post(ALERT_API_URL, { anomalyId });
-      setAlertMsg(`Alert sent for anomaly ${anomalyId}`);
-    } catch (error) {
-      const msg = (error as AxiosError).isAxiosError
-        ? `Alert API error: ${(error as AxiosError).message}`
-        : `Unexpected error: ${(error as Error).message}`;
-      setErrorMsg(msg);
-    }
-  };
-
-  /**
-   * Effect: component mount/unmount
-   */
-  useEffect(() => {
-    isMounted.current = true;
-    fetchAnomalies();
-    initWebSocket();
+    setReadyState(ws.readyState);
 
     return () => {
-      isMounted.current = false;
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      ws.removeEventListener("open", handleOpen);
+      ws.removeEventListener("close", handleClose);
+      ws.removeEventListener("error", handleError);
+      ws.removeEventListener("message", handleMessage);
+      ws.close();
     };
-  }, [fetchAnomalies, initWebSocket]);
+  }, [url, onMessage]);
 
-  /**
-   * Effect: re‑run clustering when anomalies or k change
-   */
+  return { error, readyState };
+}
+
+// Main Dashboard component -----------------------------------------------------
+export const Dashboard: FC = () => {
+  const [kalmanData, setKalmanData] = useState<KalmanForecast[]>([]);
+  const [kmeansData, setKMeansData] = useState<KMeansCluster[]>([]);
+  const [shapData, setShapData] = useState<ShapScore[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [wsError, setWsError] = useState<Error | null>(null);
+
+  // Initial data fetch (lazy loaded) -----------------------------------------
   useEffect(() => {
-    runClustering();
-  }, [anomalies, k, runClustering]);
-
-  /**
-   * UI Handlers
-   */
-  const handleKChange = (event: SelectChangeEvent<number>) => {
-    const value = Number(event.target.value);
-    if (!Number.isNaN(value) && value > 0) {
-      setK(value);
+    async function loadInitialData() {
+      try {
+        const [kForecasts, kClusters, sScores] = await Promise.all([
+          fetchWithCache<KalmanForecast[]>("/api/kalman-forecasts"),
+          fetchWithCache<KMeansCluster[]>("/api/kmeans-clusters"),
+          fetchWithCache<ShapScore[]>("/api/shap-scores"),
+        ]);
+        setKalmanData(kForecasts);
+        setKMeansData(kClusters);
+        setShapData(sScores);
+      } catch (e) {
+        console.error("Failed to load initial data:", e);
+      } finally {
+        setLoading(false);
+      }
     }
-  };
+    loadInitialData();
+  }, []);
 
-  const handleCloseSnackbar = () => {
-    setErrorMsg("");
-    setAlertMsg("");
-  };
+  // WebSocket subscription ----------------------------------------------------
+  const { error: wsErr, readyState } = useHubWebSocket(
+    "wss://example.com/hub",
+    (msg: HubMessage) => {
+      switch (msg.type) {
+        case "kalman":
+          setKalmanData((prev) => [
+            ...prev,
+            ...(msg.payload as KalmanForecast[]),
+          ]);
+          break;
+        case "kmeans":
+          setKMeansData((prev) => [
+            ...prev,
+            ...(msg.payload as KMeansCluster[]),
+          ]);
+          break;
+        case "shap":
+          setShapData((prev) => [...prev, ...(msg.payload as ShapScore[])]);
+          break;
+        default:
+          console.warn(`Unhandled message type: ${msg.type}`);
+      }
+    },
+  );
 
-  /**
-   * Render
-   */
+  useEffect(() => {
+    if (wsErr) setWsError(wsErr);
+  }, [wsErr]);
+
+  // Synchronization helper ----------------------------------------------------
+  // Align timestamps across datasets for synchronized cursor
+  const synchronizedTimestamps = React.useMemo(() => {
+    const tsSet = new Set<number>();
+    kalmanData.forEach((d) => tsSet.add(d.timestamp));
+    kmeansData.forEach((d) => tsSet.add(d.timestamp));
+    // SHAP scores may not be time based; ignore for timestamp sync
+    return Array.from(tsSet).sort((a, b) => a - b);
+  }, [kalmanData, kmeansData]);
+
+  // Render --------------------------------------------------------------------
+  if (loading) {
+    return <div>Loading dashboard...</div>;
+  }
+
+  if (wsError) {
+    return <div className="error">WebSocket error: {wsError.message}</div>;
+  }
+
   return (
-    <Box sx={{ p: 4 }}>
-      <Typography variant="h4" gutterBottom>
-        Anomaly Correlation Dashboard
-      </Typography>
+    <div className="dashboard">
+      <Suspense fallback={<div>Loading Kalman chart...</div>}>
+        <KalmanChart
+          data={kalmanData}
+          synchronizedTimestamps={synchronizedTimestamps}
+        />
+      </Suspense>
+      <Suspense fallback={<div>Loading K‑Means chart...</div>}>
+        <KMeansChart
+          data={kmeansData}
+          synchronizedTimestamps={synchronizedTimestamps}
+        />
+      </Suspense>
+      <Suspense fallback={<div>Loading SHAP chart...</div>}>
+        <ShapChart data={shapData} />
+      </Suspense>
+    </div>
+  );
+};
 
-      <Box sx={{ display: "flex", alignItems: "center", mb: 2 }}>
-        <FormControl sx={{ minWidth: 120, mr: 2 }}>
-          <InputLabel id="k-select-label">Clusters (k)</InputLabel>
-          <Select
-            labelId="k-select-label"
-            value={k}
-            label="Clusters (k)"
-            onChange={handleKChange as any}
-          >
-            {[2, 3, 4, 5, 6].map((val) => (
-              <MenuItem key={val} value={val}>
-                {val}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-        {loading && <CircularProgress size={24} />}
-      </Box>
-
-      {clusteredData.length > 0 ? (
-        <ResponsiveContainer width="100%" height={500}>
-          <ScatterChart>
-            <XAxis type="number" dataKey="featureX" name="Feature X" />
-            <YAxis type="number" dataKey="featureY" name="Feature Y" />
-            <Tooltip
+// Optional: Export default for convenience
+export default Dashboard;
