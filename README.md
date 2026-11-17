@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Recommender**](./projects/anomaly-correlation-recommender/) | `Data Science` | Python / FastAPI / Neo4j | Suggests mitigation actions for anomalies using graph analysis and Bayesian inference. |
 | [**Anomaly Correlation Gateway**](./projects/anomaly-correlation-gateway/) | `Full-Stack` | Node.js / TypeScript | Rate‑limited JWT API routing to explainer, aggregator, and dashboard services. |
 | [**Anomaly Correlation Explainer**](./projects/anomaly-correlation-explainer/) | `Data Science` | Python / FastAPI | Explain anomalies with Bayesian inference and causal scores. |
 | [**Anomaly Correlation Hub**](./projects/anomaly-correlation-hub/) | `Full-Stack` | Node.js / TypeScript / Redis | Unified API gateway with auth, rate limiting, and real‑time alerts. |
