@@ -1,178 +1,193 @@
 import os
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+import datetime
+from typing import List, Dict, Tuple, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import httpx
+from fastapi import FastAPI, Query, HTTPException, Depends
 from pydantic import BaseModel, Field, validator
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import StandardScaler
-from cachetools import LRUCache
-from jose import JWTError, jwt
 
-# -------------------- Configuration --------------------
-JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "supersecretkey")
-JWT_ALGORITHM: str = "HS256"
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 
-DBSCAN_EPS: float = 0.5  # Neighborhood radius
-DBSCAN_MIN_SAMPLES: int = 5  # Minimum points to form a cluster
+MONITOR_API_URL = os.getenv("MONITOR_API_URL", "http://localhost:8001/monitor")
+RECOMMENDER_API_URL = os.getenv(
+    "RECOMMENDER_API_URL", "http://localhost:8002/recommender"
+)
 
-# -------------------- Logging --------------------
-logging.basicConfig(level=logging.INFO)
+# Default Kalman filter parameters (tuned for typical anomaly score variance)
+DEFAULT_PROCESS_VARIANCE = float(os.getenv("KF_PROCESS_VARIANCE", "1e-5"))
+DEFAULT_MEASUREMENT_VARIANCE = float(os.getenv("KF_MEASUREMENT_VARIANCE", "1e-2"))
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger("aggregator_service")
 
-# -------------------- FastAPI App --------------------
-app = FastAPI(title="Anomaly Correlation Aggregator")
-
-# -------------------- Security --------------------
-bearer_scheme = HTTPBearer(auto_error=False)
+# --------------------------------------------------------------------------- #
+# Pydantic models
+# --------------------------------------------------------------------------- #
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+class InsightItem(BaseModel):
+    timestamp: datetime.datetime = Field(..., description="Timestamp of the observation")
+    monitor_score: float = Field(..., description="Anomaly score from monitor API")
+    recommender_score: float = Field(..., description="Anomaly score from recommender API")
+    combined_score: float = Field(..., description="Weighted combination of the two scores")
+    smoothed_score: float = Field(..., description="Kalman‑filtered combined score")
+
+
+class InsightsResponse(BaseModel):
+    insights: List[InsightItem] = Field(..., description="List of merged insights")
+
+
+# --------------------------------------------------------------------------- #
+# Kalman filter implementation
+# --------------------------------------------------------------------------- #
+
+
+class KalmanFilter1D:
     """
-    Create a JWT token.
+    Simple 1‑dimensional Kalman filter.
+
+    The filter equations are:
+        # Predict
+        x̂ₖ⁻ = x̂ₖ₋₁
+        Pₖ⁻ = Pₖ₋₁ + Q
+
+        # Update
+        Kₖ = Pₖ⁻ / (Pₖ⁻ + R)
+        x̂ₖ = x̂ₖ⁻ + Kₖ (zₖ - x̂ₖ⁻)
+        Pₖ = (1 - Kₖ) Pₖ⁻
+
+    where:
+        Q – process variance (model uncertainty)
+        R – measurement variance (sensor noise)
+        x̂ – estimated state
+        P – error covariance
+        K – Kalman gain
+        z – measurement
     """
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
+
+    def __init__(
+        self,
+        process_variance: float = DEFAULT_PROCESS_VARIANCE,
+        measurement_variance: float = DEFAULT_MEASUREMENT_VARIANCE,
+        initial_estimate: float = 0.0,
+        initial_error_covariance: float = 1.0,
+    ):
+        if process_variance <= 0 or measurement_variance <= 0:
+            raise ValueError("Variances must be positive numbers")
+        self.Q = process_variance
+        self.R = measurement_variance
+        self.x_hat = initial_estimate
+        self.P = initial_error_covariance
+
+    def filter(self, measurement: float) -> float:
+        # Predict
+        x_pred = self.x_hat
+        P_pred = self.P + self.Q
+
+        # Update
+        K = P_pred / (P_pred + self.R)
+        self.x_hat = x_pred + K * (measurement - x_pred)
+        self.P = (1 - K) * P_pred
+        return self.x_hat
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> dict:
+# --------------------------------------------------------------------------- #
+# Helper functions
+# --------------------------------------------------------------------------- #
+
+
+async def fetch_time_series(
+    client: httpx.AsyncClient, url: str, start: datetime.datetime, end: datetime.datetime
+) -> List[Dict[str, float]]:
     """
-    Verify JWT token and return payload.
+    Fetches a time‑series from a remote API.
+
+    Expected response format:
+        [
+            {"timestamp": "2023-01-01T00:00:00Z", "score": 0.12},
+            ...
+        ]
     """
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        return payload
-    except JWTError as e:
-        logger.warning(f"JWT verification failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-# -------------------- Data Models --------------------
-class AnomalyEvent(BaseModel):
-    """
-    Model representing an anomaly event emitted by the forecasting service.
-    """
-    id: str = Field(..., description="Unique identifier of the anomaly")
-    timestamp: datetime = Field(..., description="Timestamp of the anomaly detection")
-    shap_values: List[float] = Field(..., description="SHAP feature vector for the anomaly")
-
-    @validator("shap_values")
-    def shap_non_empty(cls, v):
-        if not v:
-            raise ValueError("shap_values must contain at least one element")
-        return v
-
-
-class ClusterResponse(BaseModel):
-    """
-    Response model for clustered anomaly groups.
-    """
-    clusters: Dict[int, List[str]] = Field(..., description="Mapping from cluster label to list of anomaly IDs")
-    generated_at: datetime = Field(..., description="Timestamp when the clustering result was generated")
-
-
-# -------------------- In-Memory Storage --------------------
-# Store raw anomaly vectors and their IDs
-_anomaly_store: List[Dict[str, Any]] = []
-
-# LRU cache to keep the latest clustering result (maxsize=1)
-_cluster_cache: LRUCache = LRUCache(maxsize=1)
-
-
-# -------------------- Core Logic --------------------
-def _run_dbscan_clustering(vectors: List[List[float]]) -> List[int]:
-    """
-    Run DBSCAN clustering on the provided vectors.
-    Returns a list of cluster labels aligned with input order.
-    """
-    if not vectors:
-        return []
-
-    # Standardize features: (x - μ) / σ
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(vectors)
-
-    # DBSCAN algorithm
-    dbscan = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES)
-    labels = dbscan.fit_predict(X_scaled)
-    return labels.tolist()
-
-
-def _update_clusters() -> None:
-    """
-    Recompute clustering on the stored anomaly vectors and update the LRU cache.
-    """
-    if not _anomaly_store:
-        _cluster_cache.clear()
-        return
-
-    vectors = [item["shap_values"] for item in _anomaly_store]
-    ids = [item["id"] for item in _anomaly_store]
-
-    labels = _run_dbscan_clustering(vectors)
-
-    cluster_map: Dict[int, List[str]] = {}
-    for anomaly_id, label in zip(ids, labels):
-        cluster_map.setdefault(label, []).append(anomaly_id)
-
-    # Store result with timestamp
-    result = {
-        "clusters": cluster_map,
-        "generated_at": datetime.utcnow(),
+    params = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
     }
-    _cluster_cache["latest"] = result
-    logger.info(f"Clustering updated: {len(cluster_map)} clusters")
-
-
-# -------------------- API Endpoints --------------------
-@app.post("/anomaly", status_code=status.HTTP_202_ACCEPTED, tags=["Events"])
-async def receive_anomaly(event: AnomalyEvent, request: Request) -> Dict[str, str]:
-    """
-    Endpoint to receive anomaly events (simulating subscription).
-    The payload must contain a SHAP feature vector.
-    """
-    # Basic validation already performed by Pydantic
-    _anomaly_store.append(event.dict())
-    logger.debug(f"Received anomaly event: {event.id}")
-
-    # Update clustering asynchronously to avoid blocking the request
     try:
-        _update_clusters()
-    except Exception as exc:
-        logger.exception(f"Failed to update clusters: {exc}")
-        raise HTTPException(status_code=500, detail="Clustering error")
+        resp = await client.get(url, params=params, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            raise ValueError("Response JSON is not a list")
+        # Validate each entry
+        cleaned = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get("timestamp")
+            score = entry.get("score")
+            if not isinstance(ts, str) or not isinstance(score, (int, float)):
+                continue
+            try:
+                timestamp = datetime.datetime.fromisoformat(ts.rstrip("Z"))
+            except Exception:
+                continue
+            cleaned.append({"timestamp": timestamp, "score": float(score)})
+        return cleaned
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error(f"Failed to fetch data from {url}: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to retrieve data from upstream service at {url}",
+        ) from exc
 
-    return {"detail": "Anomaly received and processed"}
 
-
-@app.get("/clusters", response_model=ClusterResponse, tags=["Analytics"])
-async def get_clusters(payload: dict = Depends(verify_token)) -> ClusterResponse:
+def align_series(
+    monitor: List[Dict[str, float]], recommender: List[Dict[str, float]]
+) -> List[Tuple[datetime.datetime, float, float]]:
     """
-    JWT-protected endpoint returning the latest clustered anomaly groups.
-    """
-    cached = _cluster_cache.get("latest")
-    if not cached:
-        # No data available yet
-        return ClusterResponse(clusters={}, generated_at=datetime.utcnow())
+    Align two series on their timestamps using an inner join.
 
-    return ClusterResponse(
-        clusters=cached["clusters"],
-        generated_at=cached["generated_at"]
-    )
+    Returns a list of tuples:
+        (timestamp, monitor_score, recommender_score)
+    """
+    monitor_map = {item["timestamp"]: item["score"] for item in monitor}
+    recommender_map = {item["timestamp"]: item["score"] for item in recommender}
+    common_ts = sorted(set(monitor_map.keys()) & set(recommender_map.keys()))
+    aligned = [
+        (ts, monitor_map[ts], recommender_map[ts]) for ts in common_ts
+    ]  # type: ignore
+    return aligned
+
+
+def compute_weighted_combination(
+    aligned: List[Tuple[datetime.datetime, float, float]],
+    monitor_weight: float,
+    recommender_weight: float,
+) -> List[Tuple[datetime.datetime, float, float, float]]:
+    """
+    Apply weights to the two scores and compute a combined score.
+
+    Returns a list of tuples:
+        (timestamp, monitor_score, recommender_score, combined_score)
+    """
+    total = monitor_weight + recommender_weight
+    if total == 0:
+        raise ValueError("Sum of weights must be greater than zero")
+    w1 = monitor_weight / total
+    w2 = recommender_weight / total
+    combined = [
+        (
+            ts,
+            m_score,
+            r_score,
+            w1 * m_score + w2 *
