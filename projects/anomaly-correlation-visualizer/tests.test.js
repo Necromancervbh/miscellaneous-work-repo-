@@ -1,86 +1,72 @@
-import React from 'react';
 import { describe, it, expect } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
-import '@testing-library/jest-dom';
-import HeatmapDashboard from './HeatmapDashboard.jsx';
+import VisualizerComponent from './visualizer_component.jsx';
 
-describe('HeatmapDashboard Component', () => {
+// Helper to suppress console errors during expected failure cases
+const suppressConsoleError = (fn) => {
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    fn();
+  } finally {
+    console.error = originalError;
+  }
+};
+
+describe('Anomaly Correlation Visualizer - VisualizerComponent', () => {
   afterEach(() => {
     cleanup();
   });
 
-  const generateData = (rows, cols, valueFn) => {
-    const data = [];
-    for (let r = 0; r < rows; r++) {
-      const row = [];
-      for (let c = 0; c < cols; c++) {
-        row.push(valueFn(r, c));
-      }
-      data.push(row);
-    }
-    return data;
-  };
-
-  it('renders correctly with normal input data', () => {
-    const normalData = generateData(3, 3, (r, c) => r * 3 + c + 1); // 1..9
-    render(<HeatmapDashboard data={normalData} />);
-    // Expect a cell for each data point
-    normalData.flat().forEach((value) => {
-      expect(screen.getByText(String(value))).toBeInTheDocument();
-    });
-    // Expect the heatmap container to be present
-    expect(screen.getByTestId('heatmap-container')).toBeInTheDocument();
+  // Normal input test
+  it('renders correctly with a typical data set', () => {
+    const sampleData = [0.1, 0.5, 0.9, 0.3, 0.7];
+    render(<VisualizerComponent data={sampleData} title="Test Chart" />);
+    // Expect the title to be rendered
+    expect(screen.getByText('Test Chart')).toBeInTheDocument();
+    // Expect a chart container (assuming it has role="img" or a canvas)
+    const chart = screen.getByTestId('anomaly-correlation-chart');
+    expect(chart).toBeInTheDocument();
+    // Verify that the chart received the correct number of data points
+    expect(chart.dataset.points).toBe(String(sampleData.length));
   });
 
+  // Edge case: empty array
   it('handles empty data array gracefully', () => {
-    render(<HeatmapDashboard data={[]} />);
-    // Should show a fallback message
+    const emptyData = [];
+    render(<VisualizerComponent data={emptyData} title="Empty Data" />);
+    expect(screen.getByText('Empty Data')).toBeInTheDocument();
+    // Should render a placeholder or message indicating no data
     expect(screen.getByText(/no data/i)).toBeInTheDocument();
-    // No heatmap cells should be rendered
-    expect(screen.queryAllByTestId('heatmap-cell')).toHaveLength(0);
+    // Chart element should not be rendered
+    expect(screen.queryByTestId('anomaly-correlation-chart')).toBeNull();
   });
 
-  it('handles data with zero values', () => {
-    const zeroData = [
-      [0, 0],
-      [0, 0],
-    ];
-    render(<HeatmapDashboard data={zeroData} />);
-    // Zero values should still render as cells
-    const cells = screen.getAllByTestId('heatmap-cell');
-    expect(cells).toHaveLength(4);
-    cells.forEach((cell) => {
-      expect(cell).toHaveTextContent('0');
+  // Edge case: array containing zero values
+  it('renders correctly when data contains zeros', () => {
+    const zeroData = [0, 0, 0, 0];
+    render(<VisualizerComponent data={zeroData} title="Zero Data" />);
+    expect(screen.getByText('Zero Data')).toBeInTheDocument();
+    const chart = screen.getByTestId('anomaly-correlation-chart');
+    expect(chart).toBeInTheDocument();
+    // Ensure the component treats zeros as valid points
+    expect(chart.dataset.points).toBe(String(zeroData.length));
+  });
+
+  // Edge case: null data prop
+  it('does not crash when data prop is null', () => {
+    suppressConsoleError(() => {
+      render(<VisualizerComponent data={null} title="Null Data" />);
     });
+    // Should fallback to empty state message
+    expect(screen.getByText(/no data/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('anomaly-correlation-chart')).toBeNull();
   });
 
-  it('handles null values within the data matrix', () => {
-    const nullData = [
-      [null, 5],
-      [10, null],
-    ];
-    render(<HeatmapDashboard data={nullData} />);
-    // Assuming null values are rendered as empty cells or a placeholder
-    const cells = screen.getAllByTestId('heatmap-cell');
-    expect(cells).toHaveLength(4);
-    // Cells with numbers should display the number
-    expect(screen.getByText('5')).toBeInTheDocument();
-    expect(screen.getByText('10')).toBeInTheDocument();
-    // Null cells might be empty strings or a dash
-    const nullCells = cells.filter((c) => c.textContent === '' || c.textContent === '-');
-    expect(nullCells).toHaveLength(2);
-  });
-
-  it('handles negative numbers correctly', () => {
-    const negativeData = [
-      [-1, -5],
-      [-10, -0.5],
-    ];
-    render(<HeatmapDashboard data={negativeData} />);
-    // All negative values should be rendered
-    negativeData.flat().forEach((value) => {
-      expect(screen.getByText(String(value))).toBeInTheDocument();
+  // Edge case: undefined data prop
+  it('does not crash when data prop is undefined', () => {
+    suppressConsoleError(() => {
+      render(<VisualizerComponent title="Undefined Data" />);
     });
-    // Optionally, check that a CSS class for negative values is applied
-    const negativeCells = screen.getAllByTestId('heatmap-cell').filter((cell) =>
-      negativeData.flat().some((val) => String(val) === cell.text
+    expect(screen.getByText(/no data/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('anomaly-correlation-chart')).toBe
