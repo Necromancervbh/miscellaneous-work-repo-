@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Ensemble API**](./projects/anomaly-correlation-ensemble-service/) | `Data Science` | Python / FastAPI | Ensemble inference combining Kalman filter and DBSCAN for robust anomaly detection. |
 | [**Anomaly Correlation Monitoring Service**](./projects/anomaly-correlation-monitor/) | `Data Science` | Python / FastAPI | Real-time monitoring and drift detection for anomaly scores. |
 | [**Anomaly Correlation Recommender**](./projects/anomaly-correlation-recommender/) | `Data Science` | Python / FastAPI / Neo4j | Suggests mitigation actions for anomalies using graph analysis and Bayesian inference. |
 | [**Anomaly Correlation Gateway**](./projects/anomaly-correlation-gateway/) | `Full-Stack` | Node.js / TypeScript | Rate‑limited JWT API routing to explainer, aggregator, and dashboard services. |
