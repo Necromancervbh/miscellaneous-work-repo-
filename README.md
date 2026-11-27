@@ -10,6 +10,7 @@ All projects are organized in individual self-contained folders inside [`project
 
 | Project | Category | Tech / Stack | Description |
 | :--- | :--- | :--- | :--- |
+| [**Anomaly Correlation Data Pipeline**](./projects/anomaly-correlation-data-pipeline/) | `Data Science` | Python / FastAPI / Pandas | ETL pipeline that enriches streams with Kalman smoothing and TF‑IDF features. |
 | [**Anomaly Correlation Monitoring Service**](./projects/anomaly-correlation-monitoring-service/) | `Data Science` | Python / FastAPI / Pandas | Aggregates scores, smooths with Kalman, forecasts trends via STL and Bayesian inference. |
 | [**Anomaly Correlation Ensemble API**](./projects/anomaly-correlation-ensemble-service/) | `Data Science` | Python / FastAPI | Ensemble inference combining Kalman filter and DBSCAN for robust anomaly detection. |
 | [**Anomaly Correlation Monitoring Service**](./projects/anomaly-correlation-monitor/) | `Data Science` | Python / FastAPI | Real-time monitoring and drift detection for anomaly scores. |
